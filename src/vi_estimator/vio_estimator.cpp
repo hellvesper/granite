@@ -75,20 +75,27 @@ std::pair<double, double> alignSVD(
     const Eigen::aligned_vector<Eigen::Vector3d>& filter_t_w_i,
     const std::vector<int64_t>& gt_t_ns,
     const Eigen::aligned_vector<Eigen::Vector3d>& gt_t_w_i,
-    Sophus::SE3d& T_gt_est, Sophus::Sim3d& sT_gt_est, bool verbose) {
+    Sophus::SE3d& T_gt_est, Sophus::Sim3d& sT_gt_est, bool verbose)
+{
+  std::cout << " ----------------------- alignSVD" << std::endl;
+
+
   Eigen::aligned_vector<Eigen::Vector3d> est_associations;
   Eigen::aligned_vector<Eigen::Vector3d> gt_associations;
 
-  for (size_t i = 0; i < filter_t_w_i.size(); i++) {
+  for (size_t i = 0; i < filter_t_w_i.size(); i++)
+  {
     int64_t t_ns = filter_t_ns[i];
 
     size_t j;
-    for (j = 0; j < gt_t_ns.size(); j++) {
+    for (j = 0; j < gt_t_ns.size(); j++)
+    {
       if (gt_t_ns.at(j) > t_ns) break;
     }
     j--;
 
-    if (j >= gt_t_ns.size() - 1) {
+    if (j >= gt_t_ns.size() - 1)
+    {
       continue;
     }
 

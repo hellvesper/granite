@@ -4,6 +4,8 @@ include("thirdparty/granite-headers/cmake_modules/PreProjectWorkarounds.cmake")
 
 project(granite)
 
+find_package(Ceres REQUIRED)
+
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules/" ${CMAKE_MODULE_PATH})
 
 if(NOT EIGEN_ROOT)
@@ -207,10 +209,14 @@ add_library(granite SHARED
   src/vi_estimator/ba_base.cpp
   src/vi_estimator/nfr_mapper.cpp
   src/vi_estimator/landmark_database.cpp
-  src/utils/keypoints.cpp)
+  src/utils/keypoints.cpp
+        include/granite/vi_estimator/types.h
+        include/granite/vi_estimator/aligner.h
+        include/granite/vi_estimator/relative_pose_error.h
+        include/granite/vi_estimator/pose_graph_solver.h)
 
 
-target_link_libraries(granite PUBLIC ${TBB_LIBRARIES} ${STD_CXX_FS} ${OpenCV_LIBS} PRIVATE rosbag apriltag opengv)
+target_link_libraries(granite PUBLIC ${TBB_LIBRARIES} ${STD_CXX_FS} ${OpenCV_LIBS} PRIVATE rosbag apriltag opengv Ceres::ceres)
 
 
 add_executable(granite_calibrate src/calibrate.cpp src/calibration/cam_calib.cpp)

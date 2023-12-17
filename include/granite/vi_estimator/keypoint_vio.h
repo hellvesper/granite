@@ -89,6 +89,8 @@ class KeypointVioEstimator : public VioEstimatorBase,
 
   void initialize(const Eigen::Vector3d& bg, const Eigen::Vector3d& ba);
 
+  virtual void pushPoseConstraints(std::vector<granite::GPSconstraint>& poseConstraints) override {};
+
   virtual ~KeypointVioEstimator() { join(); }
 
   void addIMUToQueue(const ImuData::Ptr& data);

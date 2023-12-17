@@ -87,6 +87,7 @@ void matchDescriptors(const std::vector<std::bitset<256>>& corner_descriptors_1,
                       double dist_2_best);
 
 inline void computeEssential(const Sophus::SE3d& T_0_1, Eigen::Matrix4d& E) {
+  std::cout << "computeEssential " << std::endl;
   E.setZero();
   const Eigen::Vector3d t_0_1 = T_0_1.translation();
   const Eigen::Matrix3d R_0_1 = T_0_1.rotationMatrix();

@@ -51,6 +51,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
 #include <atomic>
+#include "types.h"
 
 #include <granite/optical_flow/optical_flow.h>
 #include <granite/utils/imu_types.h>
@@ -134,6 +135,8 @@ class VioEstimatorBase {
 
   virtual void initialize(const Eigen::Vector3d& bg,
                           const Eigen::Vector3d& ba) = 0;
+
+  virtual void pushPoseConstraints(std::vector<granite::GPSconstraint>& poseConstraints) = 0;
 
   virtual const Sophus::SE3d& getT_w_i_init() = 0;
 

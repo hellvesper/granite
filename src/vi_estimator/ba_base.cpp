@@ -415,10 +415,7 @@ void BundleAdjustmentBase::computeError(
 
 void BundleAdjustmentBase::linearizeHelper(
     Eigen::aligned_vector<RelLinData<se3_SIZE>>& rld_vec,
-    const Eigen::aligned_map<
-        TimeCamId, Eigen::aligned_map<
-                       TimeCamId, Eigen::aligned_vector<KeypointObservation>>>&
-        obs_to_lin,
+    const Eigen::aligned_map<TimeCamId, Eigen::aligned_map<TimeCamId, Eigen::aligned_vector<KeypointObservation>>>& obs_to_lin,
     double& error) const {
   error = 0;
 
@@ -432,8 +429,11 @@ void BundleAdjustmentBase::linearizeHelper(
 
   tbb::parallel_for(
       tbb::blocked_range<size_t>(0, obs_tcid_vec.size()),
-      [&](const tbb::blocked_range<size_t>& range) {
-        for (size_t r = range.begin(); r != range.end(); ++r) {
+      [&](const tbb::blocked_range<size_t>& range)
+      {
+        for (size_t r = range.begin(); r != range.end(); ++r)
+        {
+          // мапа
           auto kv = obs_to_lin.find(obs_tcid_vec[r]);
 
           RelLinData<se3_SIZE>& rld = rld_vec[r];
@@ -442,9 +442,11 @@ void BundleAdjustmentBase::linearizeHelper(
 
           const TimeCamId& tcid_h = kv->first;
 
-          for (const auto& obs_kv : kv->second) {
+          for (const auto& obs_kv : kv->second)
+          {
             const TimeCamId& tcid_t = obs_kv.first;
-            if (tcid_h != tcid_t) {
+            if (tcid_h != tcid_t)
+            {
               // target and host are not the same
               rld.order.emplace_back(std::make_pair(tcid_h, tcid_t));
 

@@ -89,6 +89,8 @@ class KeypointVoEstimator : public VioEstimatorBase,
   void initialize(const Eigen::Vector3d& bg,
                   const Eigen::Vector3d& ba) override;
 
+  void pushPoseConstraints(std::vector<granite::GPSconstraint>& poseConstraints) override;
+
   virtual ~KeypointVoEstimator() { join(); }
 
   void addIMUToQueue(const ImuData::Ptr& data);
@@ -100,9 +102,10 @@ class KeypointVoEstimator : public VioEstimatorBase,
  private:
   void init_first_pose(const FrameId t_ns, const Sophus::SE3d& T_w_i);
 
-  void puplishData(const OpticalFlowResult::Ptr& opt_flow_meas) const;
+  void puplishData(const OpticalFlowResult::Ptr& opt_flow_meas);
 
   bool processFrame(const OpticalFlowResult::Ptr& opt_flow_meas);
+
 
   void rel_pose_initialisation(std::map<int64_t, int>& num_points_connected);
 
@@ -218,12 +221,24 @@ class KeypointVoEstimator : public VioEstimatorBase,
 
   // Input
 
+  std::string gps_path = "";
+
+  std::vector<granite::GPSconstraint> poseConstraints;
+  Eigen::aligned_map<int64_t, PoseStateWithLin> timestampAlignedConstraints;
+  bool reseted = false;
+
+  Eigen::aligned_map<int64_t, Sophus::SE3d> allFrames;
+  bool alignmentFound = true;
+  Sophus::SE3d algn {};
+
   Eigen::aligned_map<int64_t, OpticalFlowResult::Ptr> prev_opt_flow_res;
 
   // Marginalization
   AbsOrderMap marg_order;
   Eigen::MatrixXd marg_H;
   Eigen::VectorXd marg_b;
+
+  int64_t fakeTimestamp = 1683701468001151088;
 
   // Optimization report
   AbsOrderMap optim_order;

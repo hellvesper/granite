@@ -184,9 +184,6 @@ class BundleAdjustmentBase {
   template <size_t POSE_SIZE>
   static void linearizeRel(const RelLinData<POSE_SIZE>& rld, Eigen::MatrixXd& H,
                            Eigen::VectorXd& b) {
-    //  std::cout << "linearizeRel: KF " << frame_states.size() << " obs "
-    //            << obs.size() << std::endl;
-
     // Do schur complement
     size_t msize = rld.order.size();
     H.setZero(POSE_SIZE * msize, POSE_SIZE * msize);
@@ -231,12 +228,15 @@ class BundleAdjustmentBase {
       Eigen::Matrix<double, 5, 1>& res, double no_motion_regularizer_weight,
       Eigen::Matrix<double, 5, se3_SIZE>* d_res_d_xi = nullptr,
       Eigen::Matrix<double, 5, 3>* d_res_d_p = nullptr,
-      Eigen::Vector4d* proj = nullptr) {
+      Eigen::Vector4d* proj = nullptr)
+  {
     // Todo implement without jacobians
     Eigen::Matrix<double, 4, 2> Jup;
     Eigen::Vector4d p_h_3d;
     p_h_3d = StereographicParam<double>::unproject(kpt_pos.dir, &Jup);
     p_h_3d[3] = kpt_pos.id;
+
+    //std::cout << "linearizePoint 1" << std::endl;
 
     Eigen::Vector4d p_t_3d = T_t_h * p_h_3d;
 
@@ -323,6 +323,8 @@ class BundleAdjustmentBase {
 
     Eigen::Vector4d p_t_3d = T_t_h.matrix() * p_h_3d;
 
+    //std::cout << "linearizePoint 2 " << std::endl;
+
     Eigen::Matrix<double, 4, sim3_SIZE> d_point_d_xi;
     d_point_d_xi.topLeftCorner<3, 3>() =
         Eigen::Matrix3d::Identity() * kpt_pos.id;
@@ -401,6 +403,8 @@ class BundleAdjustmentBase {
     Eigen::Matrix<double, 4, 2> Jup;
     Eigen::Vector4d p_h_3d;
     p_h_3d = StereographicParam<double>::unproject(kpt_pos.dir, &Jup);
+
+    //std::cout << "linearizePoint 3 " << std::endl;
 
     Eigen::Matrix<double, 2, 4> Jp;
     bool valid = cam.project(p_h_3d, res, &Jp);
@@ -510,6 +514,8 @@ class BundleAdjustmentBase {
     using Scalar = typename Derived::Scalar;
     using Vec4 = Eigen::Matrix<Scalar, 4, 1>;
 
+    //std::cout << "triangulate" << std::endl;
+
     Eigen::Matrix<Scalar, 3, 4> P1, P2;
     P1.setIdentity();
     P2 = T_0_1.inverse().matrix3x4();
@@ -603,9 +609,11 @@ class BundleAdjustmentBase {
       const AbsOrderMap& aom, Eigen::MatrixXd& abs_H, Eigen::VectorXd& abs_b,
       double& error, const double weight,
       const std::unordered_map<FramePair, double>& rel_translation_constraints,
-      const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses) {
+      const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses)
+  {
     error = 0;
-    for (const auto& translation_constraint : rel_translation_constraints) {
+    for (const auto& translation_constraint : rel_translation_constraints)
+    {
       if (aom.abs_order_map.count(translation_constraint.first.frame_first) ==
               0 ||
           aom.abs_order_map.count(translation_constraint.first.frame_second) ==
@@ -622,7 +630,8 @@ class BundleAdjustmentBase {
           translation_constraint.second, T_W_first.getPoseLin(),
           T_W_second.getPoseLin(), &d_res_d_T_w_first, &d_res_d_T_w_second);
 
-      if (T_W_first.isLinearized() || T_W_second.isLinearized()) {
+      if (T_W_first.isLinearized() || T_W_second.isLinearized())
+      {
         res = relTranslationError(translation_constraint.second,
                                   T_W_first.getPose(), T_W_second.getPose());
       }
@@ -654,9 +663,9 @@ class BundleAdjustmentBase {
       Eigen::MatrixXd& abs_H, Eigen::VectorXd& abs_b, double& error,
       const double weight,
       const std::unordered_map<FramePair, double>& rel_translation_constraints,
-      const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses) {
+      const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses)
+  {
     error = 0;
-
     for (const auto& translation_constraint : rel_translation_constraints) {
       Eigen::aligned_vector<Sophus::SE3d> T_a_bs;
       std::vector<size_t> idxs;
@@ -680,12 +689,14 @@ class BundleAdjustmentBase {
 
       error += 0.5 * weight * res * res;
 
-      for (size_t i = 0; i < idxs.size(); i++) {
+      for (size_t i = 0; i < idxs.size(); i++)
+      {
         const size_t i_start = idxs.at(i) * se3_SIZE;
         abs_b.segment<se3_SIZE>(i_start) +=
             weight * d_res_d_xis.at(i).transpose() * res;
 
-        for (size_t j = 0; j < idxs.size(); j++) {
+        for (size_t j = 0; j < idxs.size(); j++)
+        {
           const size_t j_start = idxs.at(j) * se3_SIZE;
 
           abs_H.block<se3_SIZE, se3_SIZE>(i_start, j_start) +=
@@ -701,6 +712,8 @@ class BundleAdjustmentBase {
       const std::unordered_map<FramePair, double>& rel_translation_constraints,
       const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses) {
     error = 0;
+
+    /*std::cout << "linearizeRelTranslationConstraintsRelSim3 3" << std::endl;*/
 
     for (const auto& translation_constraint : rel_translation_constraints) {
       Eigen::aligned_vector<Sophus::Sim3d> T_a_bs;
@@ -724,6 +737,8 @@ class BundleAdjustmentBase {
       const double res = relTranslationErrorSim3(translation_constraint.second,
                                                  T_a_bs, &d_res_d_xis);
 
+      //std::cout << " ......... here " << std::endl;
+
       error += 0.5 * weight * res * res;
 
       for (size_t i = 0; i < idxs.size(); i++) {
@@ -745,6 +760,10 @@ class BundleAdjustmentBase {
       const AbsOrderMap& aom, double& error, const double weight,
       const std::unordered_map<FramePair, double>& rel_translation_constraints,
       const Eigen::aligned_map<int64_t, PoseStateWithLin>& poses) {
+
+
+    /*std::cout << "computeRelTranslationConstraintsError" << std::endl;*/
+
     error = 0;
     for (const auto& translation_constraint : rel_translation_constraints) {
       if (aom.abs_order_map.count(translation_constraint.first.frame_first) ==
@@ -783,11 +802,13 @@ class BundleAdjustmentBase {
   }
 
   template <class AccumT, size_t POSE_SIZE>
-  struct LinearizeAbsReduce {
+  struct LinearizeAbsReduce
+  {
     using RelLinDataIter =
         typename Eigen::aligned_vector<RelLinData<POSE_SIZE>>::iterator;
 
-    LinearizeAbsReduce(AbsOrderMap& aom) : aom(aom) {
+    LinearizeAbsReduce(AbsOrderMap& aom) : aom(aom)
+    {
       accum.reset(aom.total_size);
     }
 
@@ -848,6 +869,7 @@ class BundleAdjustmentBase {
 
   granite::Calibration<double> calib;
   std::unordered_map<FramePair, double> rel_translation_constraints;
+  std::unordered_map<FramePair, double> rel_translation_pose_constraints;
 
  protected:
   virtual void reset() {
@@ -855,6 +877,7 @@ class BundleAdjustmentBase {
     num_points_kf.clear();
     lmdb.clear();
     rel_translation_constraints.clear();
+    //rel_translation_pose_constraints.clear();
     frame_states.clear();
     frame_poses.clear();
   }
