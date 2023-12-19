@@ -19,7 +19,7 @@ Main differences are:
 ### Source installation for Ubuntu >= 18.04 and MacOS >= 10.14 Mojave
 Clone the source code for the project and build it. For MacOS you should have [Homebrew](https://brew.sh/) installed.
 ```
-git clone --recursive https://github.com/DLR-RM/granite.git
+git clone --recursive https://github.com/dhtmntmn/granite.git
 cd granite
 ./scripts/install_deps.sh
 ```
