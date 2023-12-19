@@ -228,6 +228,7 @@ class KeypointVoEstimator : public VioEstimatorBase,
   bool reseted = false;
 
   Eigen::aligned_map<int64_t, Sophus::SE3d> allFrames;
+  int allFramesCtr = 0;
   bool alignmentFound = true;
   Sophus::SE3d algn {};
 

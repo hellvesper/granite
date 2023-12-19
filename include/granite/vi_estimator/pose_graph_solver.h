@@ -17,7 +17,7 @@ void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constr
                               ceres::Problem* problem,
                               int64_t unfixed)
 {
-  ceres::LossFunction* loss_function = nullptr;
+  ceres::LossFunction* loss_function = new ceres::CauchyLoss(2.7955321);
   ceres::Manifold* quaternion_manifold = new ceres::EigenQuaternionManifold;
 
   for (const auto& constraint : constraints) {

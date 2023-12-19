@@ -251,6 +251,8 @@ class VioDataset {
       }
     }
 
+    file.close();
+
     std::cout << "lines: " << content.size() << std::endl;
 
     /*

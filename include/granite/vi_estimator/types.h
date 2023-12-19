@@ -54,6 +54,9 @@ struct GPSconstraint
   Sophus::SE3d world_pose {};
   Sophus::SE3d orig {};
 
+  Sophus::SE3d realigned_pose {};
+  bool realigned = false;
+
   int header;
 };
 

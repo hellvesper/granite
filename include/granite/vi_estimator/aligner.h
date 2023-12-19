@@ -115,7 +115,7 @@ void findAlignment(Eigen::aligned_map<int64_t, Sophus::SE3d>& allFrames,
 
 void findAlignment2(std::vector<granite::GPSconstraint>& constraints)
 {
-  auto algn = Sophus::SE3d(constraints[0].q, constraints[0].p).inverse();
+  //auto algn = Sophus::SE3d(constraints[0].q, constraints[0].p).inverse();
 
   // 'timestamp tx ty tz qx qy qz qw'
 
@@ -128,7 +128,7 @@ void findAlignment2(std::vector<granite::GPSconstraint>& constraints)
   {
     auto q = Sophus::SE3d(fr.q, fr.p);
 
-    auto newPose = algn * q;
+    auto newPose = q;
 
     //myfile << fr.timestamp << " " << newPose.translation().x() << " " << newPose.translation().y() << " " << newPose.translation().z() << " ";
     //myfile << newPose.unit_quaternion().x() << " " << newPose.so3().unit_quaternion().y() << " " << newPose.unit_quaternion().z() << " ";
@@ -143,6 +143,53 @@ void findAlignment2(std::vector<granite::GPSconstraint>& constraints)
   }
 
   //myfile.close();
+}
+
+void realign(std::vector<granite::GPSconstraint>& constraints,
+             Eigen::aligned_map<int64_t, granite::PoseStateWithLin>& frame_poses)
+{
+  std::vector<int64_t> indexes;
+
+  for (auto& frame : frame_poses)
+  {
+    indexes.push_back(frame.first);
+  }
+
+  std::sort(indexes.begin(), indexes.end());
+
+  double displacement_vis =
+      (frame_poses[indexes[0]].getPose().inverse() * frame_poses[indexes[indexes.size() - 1]].getPose())
+      .translation().norm();
+
+  auto idx1 = findNearestFrame(constraints, indexes[0]);
+  auto idx2 = findNearestFrame(constraints, indexes[indexes.size() - 1]);
+
+  double displacement_gps =
+      (constraints[idx1].world_pose.inverse() * constraints[idx2].world_pose)
+          .translation().norm();
+
+  double scale = displacement_vis / displacement_gps;
+
+  std::vector<Sophus::SE3d> relative_poses;
+  for (size_t i = 1; i < constraints.size(); ++i)
+  {
+    auto pose_prev = constraints[i - 1].world_pose;
+    auto pose_curr = constraints[i].world_pose;
+
+    auto rel = pose_prev.inverse() * pose_curr;
+    rel.translation() *= scale;
+
+    relative_poses.push_back(rel);
+  }
+
+  constraints[0].realigned_pose = Sophus::SE3d();
+  constraints[0].realigned = true;
+
+  for (size_t i = 1; i < constraints.size(); ++i)
+  {
+    constraints[i].realigned_pose = constraints[i - 1].realigned_pose * relative_poses[i - 1];
+    constraints[i].realigned = true;
+  }
 }
 
 }
