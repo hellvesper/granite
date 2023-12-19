@@ -151,7 +151,7 @@ void KeypointVoEstimator::initialize(FrameId t_ns, const Sophus::SE3d& T_w_i,
 
 void KeypointVoEstimator::pushPoseConstraints(std::vector<granite::GPSconstraint>& poseConstraints)
 {
-  pose_graph_solver::findAlignment2(poseConstraints);
+  pose_graph_solver::converQuatPositionToSophus(poseConstraints);
   this->poseConstraints = poseConstraints;
 }
 
@@ -252,25 +252,34 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
   processing_thread.reset(new std::thread(proc_func));
 }
 
+/**
+ * This function builds and optimises graph of poses using GPS data and
+ * visual constraints between them. We want to improve our visual poses
+ * by using relative GPS pose between them. After optimisation of the graph this functiuon
+ * will update the
+ * current pose (largest timestamp).
+ * @param frame_poses The vector of actual SLAM frames poses.
+ * @param constraints A vector of GPS data.
+ */
 static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_poses,
-                           std::vector<granite::GPSconstraint>& constraints,
-                           std::set<int64_t>& kf_ds)
+                           std::vector<granite::GPSconstraint>& constraints)
 {
+  // this vector will contain constraint between aligned GPS pose and visual pose
   ceres::examples::VectorOfConstraints constraintsCeres;
+  // this vector will contain constraint between visual pose (relative pose between them itself)
   ceres::examples::VectorOfConstraints constraintsCeres_poses;
+  // this vector will contain corresponding relative GPS pose between two visual frames.
   ceres::examples::VectorOfConstraints constraintsCeres_gps_rel;
+  // vector of visual poses
   ceres::examples::MapOfPoses poses_frames;
+  // vector of aligned GPS poses
   ceres::examples::MapOfPoses poses_gps;
-  if (kf_ds.empty())
-  {
-
-  }
 
   std::vector<int64_t> indexes;
   for (auto& pair : frame_poses)
   {
-
     indexes.push_back(pair.first);
+    // add visual poses itself
     auto quat = Eigen::Quaterniond(pair.second.getPose().unit_quaternion().w(),
                                    pair.second.getPose().unit_quaternion().x(),
                                    pair.second.getPose().unit_quaternion().y(),
@@ -284,16 +293,9 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
     poses_frames[pair.first] = newPose;
 
     ///  constraint
-    auto idx_gps = pose_graph_solver::findNearestFrame(constraints, pair.first);
-    if (idx_gps > 10000)
-    {
-      continue;
-    }
-    auto sophusGps = constraints[idx_gps].realigned_pose;
-
+    // add constraints between visual <-> gps poses (should be identity)
     auto sophusConstraintRel = Sophus::SE3d();
     sophusConstraintRel.setRotationMatrix(Sophus::Matrix3d::Identity());
-
     auto quat_rel = Eigen::Quaterniond(sophusConstraintRel.unit_quaternion().w(),
                                        sophusConstraintRel.unit_quaternion().x(),
                                        sophusConstraintRel.unit_quaternion().y(),
@@ -309,9 +311,11 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
     constraint.t_be = newPoseConstraint;
     constraintsCeres.push_back(constraint);
 
-    /// constraint between actual poses
-
     ///  gps
+    // add relative gps constraint
+    auto idx_gps = pose_graph_solver::findNearestFrame(constraints, pair.first);
+    auto sophusGps = constraints[idx_gps].realigned_pose;
+
     auto quat_gps = Eigen::Quaterniond(sophusGps.unit_quaternion().w(),
                                        sophusGps.unit_quaternion().x(),
                                        sophusGps.unit_quaternion().y(),
@@ -326,6 +330,7 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
 
   std::sort(indexes.begin(), indexes.end());
 
+  // add relative visual pose constraint
   if (indexes.size() > 1)
   {
     for (size_t i = 1; i < indexes.size(); ++i)
@@ -355,7 +360,7 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
     }
   }
 
-  /// gps rel
+  // add relative GPS pose constraint
   if (indexes.size() > 1)
   {
     for (size_t i = 1; i < indexes.size(); ++i)
@@ -388,6 +393,7 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
     }
   }
 
+  // build a problem and solve
   ceres::Problem problem;
   pose_graph_solver::BuildOptimizationProblem(constraintsCeres, constraintsCeres_poses,
                                               constraintsCeres_gps_rel,
@@ -395,6 +401,7 @@ static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_
                                               &poses_gps, &problem, frame_poses.rbegin()->first);
   bool res = pose_graph_solver::SolveOptimizationProblem(&problem);
 
+  // if solve was successful, update the currrent SLAM pose
   if (res)
   {
     for (auto& pair : frame_poses)
@@ -528,6 +535,8 @@ bool KeypointVoEstimator::processFrame(
 
   double threshold = 2.0;
 
+  /// i adding this condition because it seems that at the end of the sequence i have a some disconvergence between
+  /// GPS pose and visual poses, so its is better to not rely on this data anymore.
   bool lost = (dist > threshold) && (allFramesCtr < 1400);
 
   // TODO address magic number
@@ -1378,16 +1387,20 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
     int filter_iter = config.vio_filter_iteration;
     for (int iter = 0; iter < max_iter + 1; iter++)
     {
+      // wait until system will initialise and create some keyframes
+      // so we can align our GPS data. Simply wait until system will produce 100 frames.
       if (allFrames.size() > 100 && allFramesCtr < 1400)
       {
+        // we want to align only once.
         if (poseConstraints[0].realigned == false)
         {
-          std::cout << "realigned " << std::endl;
           pose_graph_solver::realign(poseConstraints, frame_poses);
         }
 
-        optimise_graph(frame_poses, poseConstraints, kf_ids);
+        // build graph and optimise our current pose only.
+        optimise_graph(frame_poses, poseConstraints);
 
+        // update the backend part, use aligned GPS constraints information here.
         for (auto& pp : rel_translation_constraints)
         {
           auto idx1 = pose_graph_solver::findNearestFrame(poseConstraints, pp.first.frame_first);
@@ -1396,11 +1409,8 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
           auto p_prev = poseConstraints[idx1].realigned_pose;
           auto p_curr = poseConstraints[idx2].realigned_pose;
 
-          //rel_translation_constraints.erase(pp.first);
           rel_translation_constraints[pp.first] = (p_prev.inverse() * p_curr).inverse().translation().norm();
         }
-
-        //reset();
       }
 
       double rld_error;

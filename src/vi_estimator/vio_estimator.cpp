@@ -77,9 +77,6 @@ std::pair<double, double> alignSVD(
     const Eigen::aligned_vector<Eigen::Vector3d>& gt_t_w_i,
     Sophus::SE3d& T_gt_est, Sophus::Sim3d& sT_gt_est, bool verbose)
 {
-  std::cout << " ----------------------- alignSVD" << std::endl;
-
-
   Eigen::aligned_vector<Eigen::Vector3d> est_associations;
   Eigen::aligned_vector<Eigen::Vector3d> gt_associations;
 

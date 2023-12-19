@@ -10,6 +10,13 @@
 #include <fstream>
 
 namespace pose_graph_solver {
+/**
+ * This function gets vector of GPS constraints, image timestamp and returns
+ * closest GPS pose.
+ * @param constraints The vector of constraints.
+ * @param queryFrameTimestamp Image timetamp.
+ * @return The closes index in vector of GPS poses.
+ */
 int findNearestFrame(const std::vector<granite::GPSconstraint>& constraints,
                      int64_t queryFrameTimestamp) {
   int64_t smallest_distance = std::numeric_limits<int64_t>::max();
@@ -113,38 +120,28 @@ void findAlignment(Eigen::aligned_map<int64_t, Sophus::SE3d>& allFrames,
  alignemt.singValuePercent = sv.y() / sv.x();
 }
 
-void findAlignment2(std::vector<granite::GPSconstraint>& constraints)
+/**
+ * Helper function to conver eigen pose/position to sophus pose.
+ * @param constraints Vector of GPS constraints.
+ */
+void converQuatPositionToSophus(std::vector<granite::GPSconstraint>& constraints)
 {
-  //auto algn = Sophus::SE3d(constraints[0].q, constraints[0].p).inverse();
-
-  // 'timestamp tx ty tz qx qy qz qw'
-
-  // std::ofstream myfile;
-  // myfile.open ("/home/artem/example.txt");
-
-  //T_global_pc
-  // T_pc_global * T_global_pc
   for (auto& fr : constraints)
   {
     auto q = Sophus::SE3d(fr.q, fr.p);
-
     auto newPose = q;
-
-    //myfile << fr.timestamp << " " << newPose.translation().x() << " " << newPose.translation().y() << " " << newPose.translation().z() << " ";
-    //myfile << newPose.unit_quaternion().x() << " " << newPose.so3().unit_quaternion().y() << " " << newPose.unit_quaternion().z() << " ";
-    //myfile << newPose.unit_quaternion().w() << "\n";
-
-    //std::cout << "new pose: \n" << newPose.matrix3x4() << std::endl;
-
     fr.world_pose = newPose;
-    //fr.orig = q;
-
-    //std::cout << "new pose2: \n" << fr.world_pose.matrix3x4() << std::endl;
   }
-
-  //myfile.close();
 }
 
+/**
+ * This function realigns global constraints to the local
+ * coordinate system by extracting the relative pose and
+ * scaling translation part between them by value
+ * [visual translation / gps translation].
+ * @param constraints Vector of GPS constraints.
+ * @param frame_poses Actual visual poses of SLAM
+ */
 void realign(std::vector<granite::GPSconstraint>& constraints,
              Eigen::aligned_map<int64_t, granite::PoseStateWithLin>& frame_poses)
 {

@@ -9,6 +9,18 @@ namespace pose_graph_solver
 {
 // Constructs the nonlinear least squares optimization problem from the pose
 // graph constraints.
+/**
+ * This function builds a pose graph problem between visual poses and GPS poses.
+ *
+ * @param constraints A vector of constraints between GPS pose and visual pose.
+ * @param constraintsCeres_poses A vector that contains constraints between visual poses (actually measured from
+ * the visual solution).
+ * @param constraintsCeres_gps_rel A vector that contains constraints between corresponding GPS poses
+ * @param poses_frames A vector of poses that will be optimised.
+ * @param poses_gps A vector of GPS poses that will be used as fixed poses in graph.
+ * @param problem A ceres problem instance.
+ * @param unfixed This represents the unfixed fram index.
+ */
 void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constraints,
                               const ceres::examples::VectorOfConstraints& constraintsCeres_poses,
                               const ceres::examples::VectorOfConstraints& constraintsCeres_gps_rel,
@@ -20,6 +32,7 @@ void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constr
   ceres::LossFunction* loss_function = new ceres::CauchyLoss(2.7955321);
   ceres::Manifold* quaternion_manifold = new ceres::EigenQuaternionManifold;
 
+  // This block adds residuals  between absolute visual and aligned GPS poses.
   for (const auto& constraint : constraints) {
     auto pose_begin_iter = poses_frames->find(constraint.timestamp);
     auto pose_end_iter = poses_gps->find(constraint.timestamp);
@@ -46,6 +59,7 @@ void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constr
     problem->SetParameterBlockConstant(pose_end_iter->second.q.coeffs().data());
   }
 
+  // This block adds residual between absolute visual poses using their visual relative measurement between them.
   for (const auto& constraint : constraintsCeres_poses) {
     auto pose_begin_iter = poses_frames->find(constraint.prev);
     auto pose_end_iter = poses_frames->find(constraint.curr);
@@ -69,6 +83,7 @@ void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constr
                          quaternion_manifold);
   }
 
+  // This block adds residual between absolute visual poses using their GPS relative measurement between them.
   for (const auto& constraint : constraintsCeres_gps_rel) {
     auto pose_begin_iter = poses_frames->find(constraint.prev);
     auto pose_end_iter = poses_frames->find(constraint.curr);
@@ -92,7 +107,7 @@ void BuildOptimizationProblem(const ceres::examples::VectorOfConstraints& constr
                          quaternion_manifold);
   }
 
-  /// fix poses
+  /// fix poses (only the last frame will be unfixed)
   for (auto& pp : *poses_frames)
   {
     if (pp.first != unfixed)

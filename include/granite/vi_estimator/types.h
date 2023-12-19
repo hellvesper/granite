@@ -42,22 +42,26 @@
 
 namespace granite
 {
+/**
+ * This struct represents the GPS constraint data that will be used in optimisation.
+ */
 struct GPSconstraint
 {
+  /// This represents timestamp of the constraint.
   int64_t timestamp;
+  /// This represents original rotation of the constraint pose.
   Eigen::Vector3d p;
+  /// This represents original position of the constraint.
   Eigen::Quaterniond q;
 
-  Eigen::Vector3d p_orig;
-  Eigen::Quaterniond q_orig;
-
+  /// This represents original GPS pose in Sophus format.
   Sophus::SE3d world_pose {};
-  Sophus::SE3d orig {};
 
+  /// This represents scaled to the world frame aligned GPS pose.
   Sophus::SE3d realigned_pose {};
-  bool realigned = false;
 
-  int header;
+  /// This boolean represents is data frame aligned or not.
+  bool realigned = false;
 };
 
 struct alignmentSe3

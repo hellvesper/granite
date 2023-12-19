@@ -221,17 +221,19 @@ class VioDataset {
     vio->out_state_queue = &out_state_queue;
   }
 
+  /**
+   * This function reads the .csv file with GPS data and returns
+   * vector of poses.
+   * @return The vector of GPS poses.
+   */
   std::vector<granite::GPSconstraint> readConstraints()
   {
+    /// Timestamps of images and GPS frames is sligtly different, so we need to
+    /// scale (gps or images) by difference un timestamps.
     int64_t firstFrame = 1683701468001151088;
-
-    // 1683701467035052544
-    // 1683701468001151088
 
     std::string path = gps_path;
     std::vector<granite::GPSconstraint> constraints;
-
-    std::cout << " <<<< PATH: " << path << std::endl;
 
     std::vector<std::vector<std::string>> content;
     std::vector<std::string> row;
@@ -253,8 +255,6 @@ class VioDataset {
 
     file.close();
 
-    std::cout << "lines: " << content.size() << std::endl;
-
     /*
      * ['Time',   ---- 0
      * 'header.seq',  ---- 1
@@ -271,9 +271,6 @@ class VioDataset {
      */
     for (size_t i = 1; i < content.size(); ++i)
     {
-      // 1683701467035052544
-      // 1683701468001151088
-
       auto rrow = content[i];
       std::string timestamp_sec = rrow[2];
       std::string timestamp_nsec = rrow[3];
@@ -295,53 +292,15 @@ class VioDataset {
       poseConstraint.timestamp = timestamp;
       poseConstraint.q = Eigen::Quaterniond(result_q_w, result_q_x, result_q_y, result_q_z);
       poseConstraint.p = Eigen::Vector3d(result_x, result_y, result_z);
-      poseConstraint.header = std::stoi(rrow[1]);
 
       constraints.push_back(poseConstraint);
     }
 
     int64_t diff = std::abs(firstFrame - constraints[0].timestamp);
-    std::cout << " --- diff: " << diff << std::endl;
-    std::cout << " --- first pc ts: " << constraints[0].timestamp << std::endl;
 
     for (auto& pc : constraints)
     {
       pc.timestamp += diff;
-    }
-
-    std::vector<Sophus::SE3d> relative;
-    for (size_t i = 1; i < constraints.size(); ++i)
-    {
-      auto pose_prev = Sophus::SE3d(constraints[i - 1].q, constraints[i - 1].p);
-      //pose_prev.translation() /= 100.0;
-      auto pose_curr = Sophus::SE3d(constraints[i].q, constraints[i].p);
-      //pose_curr.translation() /= 100.0;
-      auto prev_current = pose_prev.inverse() * pose_curr;
-      prev_current.translation() /= 500.0;
-
-
-      relative.push_back(prev_current);
-    }
-
-    // T_p1_w * T_w_p2
-    // T_w_p1 * T_p1_p2
-
-    for (size_t i = 0; i < constraints.size(); ++i)
-    {
-      if (i == 0)
-      {
-        constraints[0].orig.translation() = Sophus::Vector3d();
-      }
-      else
-      {
-        auto qwe = constraints[i - 1].orig * relative[i - 1];
-        constraints[i].orig.setRotationMatrix(qwe.rotationMatrix());
-        constraints[i].orig.translation() = qwe.translation();
-
-        //constraints[i].orig.translation().y() = 0;
-
-        std::cout << "constraints " <<  i << ": " << constraints[i].orig.matrix3x4() << std::endl;
-      }
     }
 
     return constraints;
