@@ -528,10 +528,12 @@ bool KeypointVoEstimator::processFrame(
 
   double threshold = 2.0;
 
+  bool lost = (dist > threshold) && (allFramesCtr < 1400);
+
   // TODO address magic number
   const size_t min_keyframes = calib.stereo_pairs.size() == 0 ? 2 : 1;
   if ((tracking_state == TrackingState::TRACKING &&
-      kf_ids.size() >= min_keyframes && num_points_connected_total < 7) || dist > threshold)
+      kf_ids.size() >= min_keyframes && num_points_connected_total < 7) || lost)
   {
     // tracking -------> LOST
     tracking_state = TrackingState::LOST;
@@ -542,7 +544,7 @@ bool KeypointVoEstimator::processFrame(
     reset();
     map_idx++;
 
-    if (dist > threshold)
+    if (lost)
     {
       init_first_pose(this_state_t_ns_save, pc_pose);
     }
