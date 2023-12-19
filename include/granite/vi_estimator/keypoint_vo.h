@@ -249,6 +249,15 @@ class KeypointVoEstimator : public VioEstimatorBase,
   size_t max_states;
   size_t max_kfs;
 
+  Eigen::aligned_map<int64_t, Sophus::SE3d> all_poses;
+
+  /// This will keep the real alignment as soon as we can get it.
+  /// The reason we initially use the scaled coarse alignment is calculated
+  /// because before the first rotation of the trajectory (i.e. two parallel lines
+  /// on the reference and calculated trajectory) we have nullspace in the Horn alignment,
+  /// so we will try to recalculate it and should be able to do that after first rotation.
+  std::optional<Sophus::SE3d> T_global_world;
+
   Sophus::SE3d T_w_i_init;
 
   bool map_initialized = false;

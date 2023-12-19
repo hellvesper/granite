@@ -62,7 +62,7 @@ void findAlignment(Eigen::aligned_map<int64_t, Sophus::SE3d>& allFrames,
      return;
    }
 
-   dataTranslations.push_back(constraints[alignedFrame].p);
+   dataTranslations.push_back(constraints[alignedFrame].realigned_pose.translation());
    modelTranslations.push_back(sample.second.translation());
  }
 
@@ -187,6 +187,25 @@ void realign(std::vector<granite::GPSconstraint>& constraints,
     constraints[i].realigned_pose = constraints[i - 1].realigned_pose * relative_poses[i - 1];
     constraints[i].realigned = true;
   }
+}
+
+/**
+ * This function calculates a consistent GPS trajectory using the estimated Horn alignment.
+ * This is necessary because before the first rotation in Horn we will have nullspace,
+ * so we use a very rough approximation to start with.
+ * @param constraints The vector of constraints.
+ * @param T_g_w The estimated Global <--> World frames alignment
+ */
+void realignUsingEstimatedTgw(std::vector<granite::GPSconstraint>& constraints, Sophus::SE3d& T_g_w)
+{
+  auto T_w_g = T_g_w.inverse();
+
+  for (auto& s : constraints)
+  {
+    s.realigned_pose = T_w_g * s.realigned_pose;
+  }
+
+  std::cout << "Horn realigned" << std::endl;
 }
 
 }

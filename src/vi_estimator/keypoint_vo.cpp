@@ -216,8 +216,27 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
         // init new state with pose of last state
         // const PoseStateWithLin& prev_state = frame_poses.at(prev_state_t_ns);
 
-        auto idx = pose_graph_solver::findNearestFrame(poseConstraints, this_state_t_ns);
-        auto curr_state_p = poseConstraints[idx].realigned ? poseConstraints[idx].realigned_pose :
+        // I want to use the average of the estimated visual position and the GPS position because
+        // the first alignment is very rough and can be quite far from the estimated visual
+        // pose and can blow up the solution, so make it smoother by using the average
+        // of the visual and GPS.
+        Eigen::Matrix<double, 3, 1> mean_position;
+
+        auto pose_constraint_idx = pose_graph_solver::findNearestFrame(poseConstraints, prev_state_t_ns);
+        if (poseConstraints[0].realigned)
+        {
+          mean_position = (poseConstraints[pose_constraint_idx].realigned_pose.translation() +
+                  frame_poses.at(prev_state_t_ns).getPose().translation()) / 2.0;
+        }
+
+        auto hintPose = poseConstraints[pose_constraint_idx].realigned ? poseConstraints[pose_constraint_idx].realigned_pose :
+                                                    frame_poses.at(prev_state_t_ns).getPose();
+        if (poseConstraints[0].realigned)
+        {
+          hintPose.translation() = mean_position;
+        }
+
+        auto curr_state_p = poseConstraints[pose_constraint_idx].realigned ? hintPose :
                                                          frame_poses.at(prev_state_t_ns).getPose();
 
         PoseStateWithLin curr_state(this_state_t_ns, curr_state_p);
@@ -437,6 +456,7 @@ void KeypointVoEstimator::puplishData(
     if (allFrames.count(kv.first) == 0)
     {
       allFrames[kv.first] = kv.second.getPose();
+      all_poses[kv.first] = kv.second.getPose();
     }
     frames_t_ns.push_back(kv.first);
     frames.emplace_back(kv.second.getPose());
@@ -972,13 +992,29 @@ void KeypointVoEstimator::rel_pose_initialisation(
   // try to estimate the pose relative to
   const FrameId new_keyframe_t_ns = prev_state_t_ns;
 
-  auto idx = pose_graph_solver::findNearestFrame(poseConstraints, new_keyframe_t_ns);
-  auto sPose = poseConstraints[idx].realigned ? poseConstraints[idx].realigned_pose :
+  // I want to use the average of the estimated visual position and the GPS position because
+  // the first alignment is very rough and can be quite far from the estimated visual
+  // pose and can blow up the solution, so make it smoother by using the average
+  // of the visual and GPS.
+  Eigen::Matrix<double, 3, 1> mean_position;
+
+  auto pose_constraint_idx = pose_graph_solver::findNearestFrame(poseConstraints, new_keyframe_t_ns);
+  if (poseConstraints[0].realigned)
+  {
+    mean_position = (poseConstraints[pose_constraint_idx].realigned_pose.translation() +
+           frame_poses.at(new_keyframe_t_ns).getPose().translation()) * 0.5;
+  }
+
+  auto hintPose = poseConstraints[pose_constraint_idx].realigned ? poseConstraints[pose_constraint_idx].realigned_pose :
                                               frame_poses.at(new_keyframe_t_ns).getPose();
+  if (poseConstraints[0].realigned)
+  {
+    hintPose.translation() = mean_position;
+  }
 
   Eigen::aligned_map<FrameId, Sophus::SE3d> current_T_newkfc0_prevc0s;
   const Sophus::SE3d current_T_c0_w =
-      (sPose * calib.T_i_c.at(0))
+      (hintPose * calib.T_i_c.at(0))
           .inverse();
   for (const auto& fp_kv : frame_poses) {
     current_T_newkfc0_prevc0s[fp_kv.first] =
@@ -1356,6 +1392,25 @@ void KeypointVoEstimator::marginalize(
 void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
                                    int connected_finite, const bool filter)
 {
+  granite::alignmentSe3 alignmentSe3;
+  pose_graph_solver::findAlignment(all_poses, poseConstraints, alignmentSe3);
+  std::cout << "alignmentSe3.singValuePercent: " << alignmentSe3.singValuePercent << std::endl;
+  /*
+   The idea here is that we initially use a very coarse GPS constraint, scaled by translation of visual poses.
+   So we want to try to improve this rough alignment with a real one using Horn.
+   This should succeed after the first rotation in the visual trajectory (since until
+   we have at least one rotation, we will have nullspace in the Horn alignment
+   of two straight lines). So once we've found that, rescale our constraints.
+   */
+  if (alignmentSe3.singValuePercent > 0.01)
+  {
+    if (!T_global_world.has_value())
+    {
+          T_global_world = alignmentSe3.aligment;
+          pose_graph_solver::realignUsingEstimatedTgw(poseConstraints, T_global_world.value());
+    }
+  }
+
   allFramesCtr++;
   //double weight = 1;
   if (true)
