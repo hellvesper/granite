@@ -60,7 +60,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
 
+#include <ceres/ceres.h>
+#include <granite/vi_estimator/relative_pose_error.h>
+#include <fstream>
 #include <chrono>
+#include <granite/vi_estimator/aligner.h>
+#include <granite/vi_estimator/pose_graph_solver.h>
 
 namespace granite {
 
@@ -144,6 +149,13 @@ void KeypointVoEstimator::initialize(FrameId t_ns, const Sophus::SE3d& T_w_i,
   initialize(bg, ba);
 }
 
+void KeypointVoEstimator::pushPoseConstraints(std::vector<granite::GPSconstraint>& poseConstraints)
+{
+  pose_graph_solver::converQuatPositionToSophus(poseConstraints);
+  this->poseConstraints = poseConstraints;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
 void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
                                      const Eigen::Vector3d& ba) {
   auto proc_func = [&, bg, ba] {
@@ -154,10 +166,13 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
       return;
     }
 
-    while (!should_quit) {
-      try {
+    while (!should_quit)
+    {
+      try
+      {
         vision_data_queue->pop(curr_frame);
-      } catch (const tbb::user_abort&) {
+      } catch (const tbb::user_abort&)
+      {
         curr_frame = nullptr;
       };
 
@@ -172,15 +187,18 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
         }
       }
 
-      if (!curr_frame.get()) {
+      if (!curr_frame.get())
+      {
         break;
       }
 
       // Correct camera time offset
       // curr_frame->t_ns += calib.cam_time_offset_ns;
 
-      if (imu_data_queue) {
-        while (!imu_data_queue->empty()) {
+      if (imu_data_queue)
+      {
+        while (!imu_data_queue->empty())
+        {
           ImuData::Ptr d;
           imu_data_queue->pop(d);
         }
@@ -188,19 +206,55 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
 
       this_state_t_ns = curr_frame->t_ns;
 
-      if (tracking_state == TrackingState::UNINITIALIZED) {
+      if (tracking_state == TrackingState::UNINITIALIZED)
+      {
+        std::cout << "TrackingState::UNINITIALIZED" << std::endl;
         init_first_pose(curr_frame->t_ns, Sophus::SE3d());
-      } else if (prev_state_t_ns >= 0) {
+      }
+      else if (prev_state_t_ns >= 0)
+      {
         // init new state with pose of last state
-        const PoseStateWithLin& prev_state = frame_poses.at(prev_state_t_ns);
+        // const PoseStateWithLin& prev_state = frame_poses.at(prev_state_t_ns);
 
-        PoseStateWithLin curr_state(this_state_t_ns, prev_state.getPose());
+        // I want to use the average of the estimated visual position and the GPS position because
+        // the first alignment is very rough and can be quite far from the estimated visual
+        // pose and can blow up the solution, so make it smoother by using the average
+        // of the visual and GPS.
+        Eigen::Matrix<double, 3, 1> mean_position;
+
+        auto pose_constraint_idx = pose_graph_solver::findNearestFrame(poseConstraints, prev_state_t_ns);
+        if (poseConstraints[0].realigned)
+        {
+          mean_position = (poseConstraints[pose_constraint_idx].realigned_pose.translation() +
+                  frame_poses.at(prev_state_t_ns).getPose().translation()) / 2.0;
+        }
+
+        auto hintPose = poseConstraints[pose_constraint_idx].realigned ? poseConstraints[pose_constraint_idx].realigned_pose :
+                                                    frame_poses.at(prev_state_t_ns).getPose();
+        if (poseConstraints[0].realigned)
+        {
+          hintPose.translation() = mean_position;
+        }
+
+        auto curr_state_p = poseConstraints[pose_constraint_idx].realigned ? hintPose :
+                                                         frame_poses.at(prev_state_t_ns).getPose();
+
+        PoseStateWithLin curr_state(this_state_t_ns, curr_state_p);
+
+        /*const PoseStateWithLin& prev_state = frame_poses.at(prev_state_t_ns);
+        PoseStateWithLin curr_state(this_state_t_ns, prev_state.getPose());*/
+
+
         frame_poses[this_state_t_ns] = curr_state;
       }
 
-      if (!processFrame(curr_frame)) {
+
+      if (!processFrame(curr_frame))
+      {
         break;
       }
+
+
     }
 
     if (out_vis_queue) out_vis_queue->push(nullptr);
@@ -217,21 +271,199 @@ void KeypointVoEstimator::initialize(const Eigen::Vector3d& bg,
   processing_thread.reset(new std::thread(proc_func));
 }
 
+/**
+ * This function builds and optimises graph of poses using GPS data and
+ * visual constraints between them. We want to improve our visual poses
+ * by using relative GPS pose between them. After optimisation of the graph this functiuon
+ * will update the
+ * current pose (largest timestamp).
+ * @param frame_poses The vector of actual SLAM frames poses.
+ * @param constraints A vector of GPS data.
+ */
+static void optimise_graph(Eigen::aligned_map<int64_t, PoseStateWithLin>& frame_poses,
+                           std::vector<granite::GPSconstraint>& constraints)
+{
+  // this vector will contain constraint between aligned GPS pose and visual pose
+  ceres::examples::VectorOfConstraints constraintsCeres;
+  // this vector will contain constraint between visual pose (relative pose between them itself)
+  ceres::examples::VectorOfConstraints constraintsCeres_poses;
+  // this vector will contain corresponding relative GPS pose between two visual frames.
+  ceres::examples::VectorOfConstraints constraintsCeres_gps_rel;
+  // vector of visual poses
+  ceres::examples::MapOfPoses poses_frames;
+  // vector of aligned GPS poses
+  ceres::examples::MapOfPoses poses_gps;
+
+  std::vector<int64_t> indexes;
+  for (auto& pair : frame_poses)
+  {
+    indexes.push_back(pair.first);
+    // add visual poses itself
+    auto quat = Eigen::Quaterniond(pair.second.getPose().unit_quaternion().w(),
+                                   pair.second.getPose().unit_quaternion().x(),
+                                   pair.second.getPose().unit_quaternion().y(),
+                                   pair.second.getPose().unit_quaternion().z());
+    auto t = pair.second.getPose().translation();
+
+    ceres::examples::Pose3d newPose;
+    newPose.q = quat;
+    newPose.p = t;
+
+    poses_frames[pair.first] = newPose;
+
+    ///  constraint
+    // add constraints between visual <-> gps poses (should be identity)
+    auto sophusConstraintRel = Sophus::SE3d();
+    sophusConstraintRel.setRotationMatrix(Sophus::Matrix3d::Identity());
+    auto quat_rel = Eigen::Quaterniond(sophusConstraintRel.unit_quaternion().w(),
+                                       sophusConstraintRel.unit_quaternion().x(),
+                                       sophusConstraintRel.unit_quaternion().y(),
+                                       sophusConstraintRel.unit_quaternion().z());
+    auto t_rel = sophusConstraintRel.translation();
+
+    ceres::examples::Pose3d newPoseConstraint;
+    newPoseConstraint.q = quat_rel;
+    newPoseConstraint.p = t_rel;
+
+    ceres::examples::Constraint3d constraint;
+    constraint.timestamp = pair.first;
+    constraint.t_be = newPoseConstraint;
+    constraintsCeres.push_back(constraint);
+
+    ///  gps
+    // add relative gps constraint
+    auto idx_gps = pose_graph_solver::findNearestFrame(constraints, pair.first);
+    auto sophusGps = constraints[idx_gps].realigned_pose;
+
+    auto quat_gps = Eigen::Quaterniond(sophusGps.unit_quaternion().w(),
+                                       sophusGps.unit_quaternion().x(),
+                                       sophusGps.unit_quaternion().y(),
+                                       sophusGps.unit_quaternion().z());
+    auto t_gps = sophusGps.translation();
+
+    ceres::examples::Pose3d newPoseGps;
+    newPoseGps.q = quat_gps;
+    newPoseGps.p = t_gps;
+    poses_gps[pair.first] = newPoseGps;
+  }
+
+  std::sort(indexes.begin(), indexes.end());
+
+  // add relative visual pose constraint
+  if (indexes.size() > 1)
+  {
+    for (size_t i = 1; i < indexes.size(); ++i)
+    {
+      int64_t timestamp_prev = indexes[i - 1];
+      int64_t timestamp_curr = indexes[i];
+
+      auto posePrev = frame_poses[timestamp_prev].getPose();
+      auto poseCurr = frame_poses[timestamp_curr].getPose();
+      auto rel = posePrev.inverse() * poseCurr;
+
+      auto quat_rel = Eigen::Quaterniond(rel.unit_quaternion().w(),
+                                         rel.unit_quaternion().x(),
+                                         rel.unit_quaternion().y(),
+                                         rel.unit_quaternion().z());
+      auto t_rel = rel.translation();
+
+      ceres::examples::Pose3d newPoseConstraint;
+      newPoseConstraint.q = quat_rel;
+      newPoseConstraint.p = t_rel;
+
+      ceres::examples::Constraint3d constraint;
+      constraint.prev = timestamp_prev;
+      constraint.curr = timestamp_curr;
+      constraint.t_be = newPoseConstraint;
+      constraintsCeres_poses.push_back(constraint);
+    }
+  }
+
+  // add relative GPS pose constraint
+  if (indexes.size() > 1)
+  {
+    for (size_t i = 1; i < indexes.size(); ++i)
+    {
+      int64_t timestamp_prev = indexes[i - 1];
+      int64_t timestamp_curr = indexes[i];
+
+      auto poseConstrainIdxPrev = pose_graph_solver::findNearestFrame(constraints, timestamp_prev);
+      auto poseConstrainIdxCurr = pose_graph_solver::findNearestFrame(constraints, timestamp_curr);
+
+      auto posePrev = constraints[poseConstrainIdxPrev].realigned_pose;
+      auto poseCurr = constraints[poseConstrainIdxCurr].realigned_pose;
+      auto rel = posePrev.inverse() * poseCurr;
+
+      auto quat_rel = Eigen::Quaterniond(rel.unit_quaternion().w(),
+                                         rel.unit_quaternion().x(),
+                                         rel.unit_quaternion().y(),
+                                         rel.unit_quaternion().z());
+      auto t_rel = rel.translation();
+
+      ceres::examples::Pose3d newPoseConstraint;
+      newPoseConstraint.q = quat_rel;
+      newPoseConstraint.p = t_rel;
+
+      ceres::examples::Constraint3d constraint;
+      constraint.prev = timestamp_prev;
+      constraint.curr = timestamp_curr;
+      constraint.t_be = newPoseConstraint;
+      constraintsCeres_gps_rel.push_back(constraint);
+    }
+  }
+
+  // build a problem and solve
+  ceres::Problem problem;
+  pose_graph_solver::BuildOptimizationProblem(constraintsCeres, constraintsCeres_poses,
+                                              constraintsCeres_gps_rel,
+                                              &poses_frames,
+                                              &poses_gps, &problem, frame_poses.rbegin()->first);
+  bool res = pose_graph_solver::SolveOptimizationProblem(&problem);
+
+  // if solve was successful, update the currrent SLAM pose
+  if (res)
+  {
+    for (auto& pair : frame_poses)
+    {
+      if (pair.first == frame_poses.rbegin()->first)
+      {
+        ceres::examples::Pose3d newPose = poses_frames[pair.first];
+        Sophus::SE3d newSophusPose(newPose.q, newPose.p);
+
+        bool is_linearised = pair.second.isLinearized();
+        pair.second = PoseStateWithLin(pair.first, newSophusPose);
+        if (is_linearised)
+        {
+          pair.second.setLinTrue();
+        }
+      }
+    }
+  }
+}
+
 void KeypointVoEstimator::addVisionToQueue(const OpticalFlowResult::Ptr& data) {
   vision_data_queue->push(data);
 }
 
 void KeypointVoEstimator::puplishData(
-    const OpticalFlowResult::Ptr& opt_flow_meas) const {
+    const OpticalFlowResult::Ptr& opt_flow_meas)
+{
   GRANITE_ASSERT(frame_states.empty());
   std::vector<FrameId> frames_t_ns;
   Eigen::aligned_vector<Sophus::SE3d> frames;
-  for (const auto& kv : frame_poses) {
+  for (const auto& kv : frame_poses)
+  {
+    if (allFrames.count(kv.first) == 0)
+    {
+      allFrames[kv.first] = kv.second.getPose();
+      all_poses[kv.first] = kv.second.getPose();
+    }
     frames_t_ns.push_back(kv.first);
     frames.emplace_back(kv.second.getPose());
   }
 
-  if (out_state_queue) {
+  if (out_state_queue)
+  {
     VioStateData::Ptr data(new VioStateData());
 
     const PoseStateWithLin& p = frame_poses.crbegin()->second;
@@ -260,7 +492,9 @@ void KeypointVoEstimator::puplishData(
     out_state_queue->push(data);
   }
 
-  if (out_vis_queue) {
+  // frames added here
+  if (out_vis_queue)
+  {
     VioVisualizationData::Ptr data(new VioVisualizationData);
 
     data->t_ns = this_state_t_ns;
@@ -305,36 +539,68 @@ bool KeypointVoEstimator::processFrame(
   // detect failure
   const int num_points_connected_total = std::accumulate(
       std::begin(num_points_connected), std::end(num_points_connected), 0,
-      [](const int previous, const std::pair<const int64_t, int>& p) {
+      [](const int previous, const std::pair<const int64_t, int>& p)
+      {
         return previous + p.second;
       });
 
+  double dist = 0.0;
+  auto idx1 = frame_poses.rbegin()->first;
+  auto pc_idx1 = pose_graph_solver::findNearestFrame(poseConstraints, idx1);
+  auto pc_pose = poseConstraints[pc_idx1].realigned_pose;
+  if (poseConstraints[0].realigned)
+  {
+    dist = (frame_poses.rbegin()->second.getPose().inverse() * pc_pose).translation().norm();
+  }
+
+  double threshold = 2.0;
+
+  /// i adding this condition because it seems that at the end of the sequence i have a some disconvergence between
+  /// GPS pose and visual poses, so its is better to not rely on this data anymore.
+  bool lost = (dist > threshold) && (allFramesCtr < 1400);
+
   // TODO address magic number
   const size_t min_keyframes = calib.stereo_pairs.size() == 0 ? 2 : 1;
-  if (tracking_state == TrackingState::TRACKING &&
-      kf_ids.size() >= min_keyframes && num_points_connected_total < 7) {
+  if ((tracking_state == TrackingState::TRACKING &&
+      kf_ids.size() >= min_keyframes && num_points_connected_total < 7) || lost)
+  {
+    // tracking -------> LOST
     tracking_state = TrackingState::LOST;
+    allFrames.clear();
 
     const FrameId this_state_t_ns_save = this_state_t_ns;
 
     reset();
     map_idx++;
 
-    init_first_pose(this_state_t_ns_save, Sophus::SE3d());
+    if (lost)
+    {
+      init_first_pose(this_state_t_ns_save, pc_pose);
+    }
+    else
+    {
+      init_first_pose(this_state_t_ns_save, Sophus::SE3d());
+    }
+
     num_points_connected = measure(opt_flow_meas);
 
     puplishData(opt_flow_meas);
-  } else {
+  }
+  else
+  {
     puplishData(opt_flow_meas);
     marginalize(num_points_connected);
   }
 
   // output
 
+
+
   // prepare next step
   prev_state_t_ns = this_state_t_ns;
   last_processed_t_ns = this_state_t_ns;
-  if (take_kf) {
+  if (take_kf)
+  {
     average_negative_entropy_last_frame = 0;
   }
 
@@ -346,14 +612,18 @@ bool KeypointVoEstimator::processFrame(
   return true;
 }
 
+
+
 std::map<int64_t, int> KeypointVoEstimator::measure(
-    const OpticalFlowResult::Ptr& opt_flow_meas) {
+    const OpticalFlowResult::Ptr& opt_flow_meas)
+{
   GRANITE_ASSERT_MSG(tracking_state == TrackingState::TRACKING,
                     "You tried to track a frame but the system state is not "
                     "TRACKING. Try initializing it first.");
 
   // save results
   prev_opt_flow_res[opt_flow_meas->t_ns] = opt_flow_meas;
+  //prev_opt_flow_res[opt_flow_meas->t_ns].
 
   // Make new residual for existing keypoints
   int connected_finite = 0;
@@ -365,10 +635,12 @@ std::map<int64_t, int> KeypointVoEstimator::measure(
     bool is_main_cam = std::count(calib.main_cam_idx.begin(),
                                   calib.main_cam_idx.end(), i) != 0;
 
-    for (const auto& kv_obs : opt_flow_meas->observations[i]) {
+    for (const auto& kv_obs : opt_flow_meas->observations[i])
+    {
       KeypointId kpt_id = kv_obs.first;
 
-      if (lmdb.landmarkExists(kpt_id)) {
+      if (lmdb.landmarkExists(kpt_id))
+      {
         const KeypointPosition& kpt_pos = lmdb.getLandmark(kpt_id);
         const TimeCamId& tcid_host = kpt_pos.kf_id;
 
@@ -392,14 +664,6 @@ std::map<int64_t, int> KeypointVoEstimator::measure(
         }
       }
     }
-  }
-
-  if (config.vio_debug) {
-    std::cout << "connected_finite: " << connected_finite << "\nunconnected:\n";
-    for (const auto& kv_unc : this_unconnected_obs) {
-      std::cout << kv_unc.first << ": " << kv_unc.second.size() << '\n';
-    }
-    std::cout << std::endl;
   }
 
   optimize(num_points_connected, connected_finite);
@@ -728,9 +992,29 @@ void KeypointVoEstimator::rel_pose_initialisation(
   // try to estimate the pose relative to
   const FrameId new_keyframe_t_ns = prev_state_t_ns;
 
+  // I want to use the average of the estimated visual position and the GPS position because
+  // the first alignment is very rough and can be quite far from the estimated visual
+  // pose and can blow up the solution, so make it smoother by using the average
+  // of the visual and GPS.
+  Eigen::Matrix<double, 3, 1> mean_position;
+
+  auto pose_constraint_idx = pose_graph_solver::findNearestFrame(poseConstraints, new_keyframe_t_ns);
+  if (poseConstraints[0].realigned)
+  {
+    mean_position = (poseConstraints[pose_constraint_idx].realigned_pose.translation() +
+           frame_poses.at(new_keyframe_t_ns).getPose().translation()) * 0.5;
+  }
+
+  auto hintPose = poseConstraints[pose_constraint_idx].realigned ? poseConstraints[pose_constraint_idx].realigned_pose :
+                                              frame_poses.at(new_keyframe_t_ns).getPose();
+  if (poseConstraints[0].realigned)
+  {
+    hintPose.translation() = mean_position;
+  }
+
   Eigen::aligned_map<FrameId, Sophus::SE3d> current_T_newkfc0_prevc0s;
   const Sophus::SE3d current_T_c0_w =
-      (frame_poses.at(new_keyframe_t_ns).getPose() * calib.T_i_c.at(0))
+      (hintPose * calib.T_i_c.at(0))
           .inverse();
   for (const auto& fp_kv : frame_poses) {
     current_T_newkfc0_prevc0s[fp_kv.first] =
@@ -827,21 +1111,29 @@ void KeypointVoEstimator::checkMargNullspace() const {
 }
 
 void KeypointVoEstimator::marginalize(
-    std::map<FrameId, int>& num_points_connected) {
+    std::map<FrameId, int>& num_points_connected)
+{
+  //double weight = 1;
   GRANITE_ASSERT(frame_states.empty());
 
-  if (true) {
+  if (true)
+  {
     // Marginalize
 
     AbsOrderMap aom;
 
     // remove all frame_poses that are not kfs and not the current frame
     std::set<FrameId> non_kf_poses;
-    for (const auto& kv : frame_poses) {
-      if (kf_ids.count(kv.first) == 0 && kv.first != this_state_t_ns) {
+    for (const auto& kv : frame_poses)
+    {
+      if (kf_ids.count(kv.first) == 0 && kv.first != this_state_t_ns)
+      {
         non_kf_poses.emplace(kv.first);
-      } else {
-        if (kv.first != this_state_t_ns) {
+      }
+      else
+      {
+        if (kv.first != this_state_t_ns)
+        {
           aom.abs_order_map[kv.first] =
               std::make_pair(aom.total_size, se3_SIZE);
 
@@ -856,7 +1148,8 @@ void KeypointVoEstimator::marginalize(
       }
     }
 
-    for (int64_t id : non_kf_poses) {
+    for (int64_t id : non_kf_poses)
+    {
       frame_poses.erase(id);
       lmdb.removeFrame(id);
       prev_opt_flow_res.erase(id);
@@ -864,20 +1157,23 @@ void KeypointVoEstimator::marginalize(
 
     auto kf_ids_all = kf_ids;
     std::set<FrameId> kfs_to_marg;
-    while (kf_ids.size() > max_kfs) {
+    while (kf_ids.size() > max_kfs)
+    {
       int64_t id_to_marg = -1;
-
       {
         std::vector<int64_t> ids;
-        for (int64_t id : kf_ids) {
+        for (int64_t id : kf_ids)
+        {
           ids.push_back(id);
         }
 
-        for (size_t i = 0; i < ids.size() - 2; i++) {
+        for (size_t i = 0; i < ids.size() - 2; i++)
+        {
           if (num_points_connected.count(ids[i]) == 0 ||
               num_points_kf.at(ids[i]) == 0 ||
               (num_points_connected.at(ids[i]) / num_points_kf.at(ids[i]) <
-               0.05)) {
+               0.05))
+          {
             id_to_marg = ids[i];
             break;
           }
@@ -886,7 +1182,8 @@ void KeypointVoEstimator::marginalize(
 
       if (id_to_marg < 0) {
         std::vector<int64_t> ids;
-        for (int64_t id : kf_ids) {
+        for (int64_t id : kf_ids)
+        {
           ids.push_back(id);
         }
 
@@ -894,9 +1191,11 @@ void KeypointVoEstimator::marginalize(
         double min_score = std::numeric_limits<double>::max();
         int64_t min_score_id = -1;
 
-        for (size_t i = 0; i < ids.size() - 2; i++) {
+        for (size_t i = 0; i < ids.size() - 2; i++)
+        {
           double denom = 0;
-          for (size_t j = 0; j < ids.size() - 2; j++) {
+          for (size_t j = 0; j < ids.size() - 2; j++)
+          {
             denom += 1 / ((frame_poses.at(ids[i]).getPose().translation() -
                            frame_poses.at(ids[j]).getPose().translation())
                               .norm() +
@@ -909,7 +1208,8 @@ void KeypointVoEstimator::marginalize(
                             .norm()) *
               denom;
 
-          if (score < min_score) {
+          if (score < min_score)
+          {
             min_score_id = ids[i];
             min_score = score;
           }
@@ -924,29 +1224,8 @@ void KeypointVoEstimator::marginalize(
       kf_ids.erase(id_to_marg);
     }
 
-    //    std::cout << "marg order" << std::endl;
-    //    aom.print_order();
-
-    //    std::cout << "marg prior order" << std::endl;
-    //    marg_order.print_order();
-
-    if (config.vio_debug) {
-      std::cout << "non_kf_poses.size() " << non_kf_poses.size() << std::endl;
-      for (const auto& v : non_kf_poses) std::cout << v << ' ';
-      std::cout << std::endl;
-
-      std::cout << "kfs_to_marg.size() " << kfs_to_marg.size() << std::endl;
-      for (const auto& v : kfs_to_marg) std::cout << v << ' ';
-      std::cout << std::endl;
-
-      std::cout << "this_state_t_ns " << this_state_t_ns << std::endl;
-
-      std::cout << "frame_poses.size() " << frame_poses.size() << std::endl;
-      for (const auto& v : frame_poses) std::cout << v.first << ' ';
-      std::cout << std::endl;
-    }
-
-    if (!kfs_to_marg.empty()) {
+    if (!kfs_to_marg.empty())
+    {
       // Marginalize only if last state is a keyframe
       // GRANITE_ASSERT(kf_ids_all.count(this_state_t_ns) > 0);
       GRANITE_ASSERT(kf_ids_all.count(prev_state_t_ns) > 0);
@@ -967,10 +1246,13 @@ void KeypointVoEstimator::marginalize(
             obs_to_lin;
 
         for (auto it = lmdb.getObservations().cbegin();
-             it != lmdb.getObservations().cend();) {
-          if (kfs_to_marg.count(it->first.frame_id) > 0) {
+             it != lmdb.getObservations().cend();)
+        {
+          if (kfs_to_marg.count(it->first.frame_id) > 0)
+          {
             for (auto it2 = it->second.cbegin(); it2 != it->second.cend();
-                 ++it2) {
+                 ++it2)
+            {
               obs_to_lin[it->first].emplace(*it2);
             }
           }
@@ -982,7 +1264,8 @@ void KeypointVoEstimator::marginalize(
 
         linearizeHelper(rld_vec, obs_to_lin, rld_error);
 
-        for (auto& rld : rld_vec) {
+        for (auto& rld : rld_vec)
+        {
           rld.invert_keypoint_hessians();
 
           Eigen::MatrixXd rel_H;
@@ -993,21 +1276,29 @@ void KeypointVoEstimator::marginalize(
         }
       }
 
-      // std::cout << "accum.getH()\n" << accum.getH() << std::endl;
-
+      // rel_translation_pose_constraints
       double rel_pose_constraint_error = 0;
+      //double rel_pose_constraint_pc_error = 0;
+/*      linearizeRelTranslationConstraints(
+          aom, accum.getH(), accum.getB(), rel_pose_constraint_pc_error,
+          config.vio_init_pose_weight, rel_translation_pose_constraints,
+          frame_poses);*/
+
+/*      linearizeRelTranslationConstraintsRelSE3(accum.getH(), accum.getB(),
+                                               rel_pose_constraint_pc_error, weight,
+                                               rel_translation_pose_constraints, frame_poses);*/
       linearizeRelTranslationConstraints(
           aom, accum.getH(), accum.getB(), rel_pose_constraint_error,
           config.vio_init_pose_weight, rel_translation_constraints,
           frame_poses);
 
+
       linearizeMargPrior(marg_order, marg_H, marg_b, aom, accum.getH(),
                          accum.getB(), marg_prior_error);
 
       // Save marginalization prior
-      if (out_marg_queue && !kfs_to_marg.empty()) {
-        // int64_t kf_id = *kfs_to_marg.begin();
-
+      if (out_marg_queue && !kfs_to_marg.empty())
+      {
         {
           MargData::Ptr m(new MargData);
           m->aom = aom;
@@ -1043,26 +1334,19 @@ void KeypointVoEstimator::marginalize(
         }
       }
 
-      if (config.vio_debug) {
-        std::cout << "keeping " << idx_to_keep.size() << " marg "
-                  << idx_to_marg.size() << " total " << asize << std::endl;
-        std::cout << " frame_poses " << frame_poses.size() << " frame_states "
-                  << frame_states.size() << std::endl;
-      }
-
-      // std::cout << "accum.getH()\n" << accum.getH() << std::endl;
-
       Eigen::MatrixXd marg_H_new;
       Eigen::VectorXd marg_b_new;
       marginalizeHelper(accum.getH(), accum.getB(), idx_to_keep, idx_to_marg,
                         marg_H_new, marg_b_new);
 
-      for (auto& kv : frame_poses) {
+      for (auto& kv : frame_poses)
+      {
         if (kv.first != this_state_t_ns && !kv.second.isLinearized())
           kv.second.setLinTrue();
       }
 
-      for (const FrameId id : kfs_to_marg) {
+      for (const FrameId id : kfs_to_marg)
+      {
         frame_poses.erase(id);
         prev_opt_flow_res.erase(id);
         eraseRelTranslationConstraints(id);
@@ -1099,32 +1383,44 @@ void KeypointVoEstimator::marginalize(
       Eigen::VectorXd delta;
       computeDelta(marg_order, delta);
       marg_b -= marg_H * delta;
-
-      if (config.vio_debug) {
-        std::cout << "marginalization done!!" << std::endl;
-
-        std::cout << "======== Marg nullspace ==========" << std::endl;
-        checkMargNullspace();
-        std::cout << "=================================" << std::endl;
-      }
     }
-
-    //    std::cout << "new marg prior order" << std::endl;
-    //    marg_order.print_order();
   }
+
+  rel_translation_pose_constraints.clear();
 }
 
 void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
-                                   int connected_finite, const bool filter) {
-  if (config.vio_debug) {
-    std::cout << "=================================" << std::endl;
+                                   int connected_finite, const bool filter)
+{
+  granite::alignmentSe3 alignmentSe3;
+  pose_graph_solver::findAlignment(all_poses, poseConstraints, alignmentSe3);
+  std::cout << "alignmentSe3.singValuePercent: " << alignmentSe3.singValuePercent << std::endl;
+  /*
+   The idea here is that we initially use a very coarse GPS constraint, scaled by translation of visual poses.
+   So we want to try to improve this rough alignment with a real one using Horn.
+   This should succeed after the first rotation in the visual trajectory (since until
+   we have at least one rotation, we will have nullspace in the Horn alignment
+   of two straight lines). So once we've found that, rescale our constraints.
+   */
+  if (alignmentSe3.singValuePercent > 0.01)
+  {
+    if (!T_global_world.has_value())
+    {
+          T_global_world = alignmentSe3.aligment;
+          pose_graph_solver::realignUsingEstimatedTgw(poseConstraints, T_global_world.value());
+    }
   }
 
-  if (true) {
+  allFramesCtr++;
+  //double weight = 1;
+  if (true)
+  {
     // Optimize
-
+    std::vector<int64_t> indexes;
     optim_order.clear();
-    for (const auto& kv : frame_poses) {
+    timestampAlignedConstraints.clear();
+    for (auto& kv : frame_poses)
+    {
       optim_order.abs_order_map[kv.first] =
           std::make_pair(optim_order.total_size, se3_SIZE);
 
@@ -1139,70 +1435,105 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
 
     GRANITE_ASSERT(frame_states.empty());
 
-    //    std::cout << "opt order" << std::endl;
-    //    optim_order.print_order();
-
-    //    std::cout << "marg prior order" << std::endl;
-    //    marg_order.print_order();
-
     Eigen::MatrixXd H_keyframe_decision;
     Eigen::VectorXd b_keyframe_decision;
 
     int max_iter = config.vio_max_iterations;
     int filter_iter = config.vio_filter_iteration;
-    for (int iter = 0; iter < max_iter + 1; iter++) {
-      auto t1 = std::chrono::high_resolution_clock::now();
+    for (int iter = 0; iter < max_iter + 1; iter++)
+    {
+      // wait until system will initialise and create some keyframes
+      // so we can align our GPS data. Simply wait until system will produce 100 frames.
+      if (allFrames.size() > 100 && allFramesCtr < 1400)
+      {
+        // we want to align only once.
+        if (poseConstraints[0].realigned == false)
+        {
+          pose_graph_solver::realign(poseConstraints, frame_poses);
+        }
+
+        // build graph and optimise our current pose only.
+        optimise_graph(frame_poses, poseConstraints);
+
+        // update the backend part, use aligned GPS constraints information here.
+        for (auto& pp : rel_translation_constraints)
+        {
+          auto idx1 = pose_graph_solver::findNearestFrame(poseConstraints, pp.first.frame_first);
+          auto idx2 = pose_graph_solver::findNearestFrame(poseConstraints, pp.first.frame_second);
+
+          auto p_prev = poseConstraints[idx1].realigned_pose;
+          auto p_curr = poseConstraints[idx2].realigned_pose;
+
+          rel_translation_constraints[pp.first] = (p_prev.inverse() * p_curr).inverse().translation().norm();
+        }
+      }
 
       double rld_error;
       Eigen::aligned_vector<RelLinData<se3_SIZE>> rld_vec;
       linearizeHelper(rld_vec, lmdb.getObservations(), rld_error);
 
-      BundleAdjustmentBase::LinearizeAbsReduce<DenseAccumulator<double>,
-                                               se3_SIZE>
-          lopt(optim_order);
+      BundleAdjustmentBase::LinearizeAbsReduce<DenseAccumulator<double>, se3_SIZE> lopt(optim_order);
 
-      tbb::blocked_range<Eigen::aligned_vector<RelLinData<se3_SIZE>>::iterator>
-          range(rld_vec.begin(), rld_vec.end());
+      tbb::blocked_range<Eigen::aligned_vector<RelLinData<se3_SIZE>>::iterator> range(rld_vec.begin(), rld_vec.end());
 
       tbb::parallel_reduce(range, lopt);
-
+      double rel_pose_pc_constraint_error = 0;
       double rel_pose_constraint_error = 0;
+
+
       linearizeRelTranslationConstraints(
           optim_order, lopt.accum.getH(), lopt.accum.getB(),
           rel_pose_constraint_error, config.vio_init_pose_weight,
           rel_translation_constraints, frame_poses);
+
+/*      linearizeRelTranslationConstraints(
+          optim_order, lopt.accum.getH(), lopt.accum.getB(),
+          rel_pose_pc_constraint_error, config.vio_init_pose_weight,
+          rel_translation_pose_constraints, frame_poses);*/
+
+/*      linearizeRelTranslationConstraintsRelSE3(lopt.accum.getH(), lopt.accum.getB(),
+                                               rel_pose_pc_constraint_error, weight,
+                                               rel_translation_pose_constraints, frame_poses);*/
 
       double marg_prior_error = 0;
       linearizeMargPrior(marg_order, marg_H, marg_b, optim_order,
                          lopt.accum.getH(), lopt.accum.getB(),
                          marg_prior_error);
 
-      double error_total =
-          rld_error + rel_pose_constraint_error + marg_prior_error;
+      marg_prior_error = 0.0;
 
-      if (config.vio_debug)
-        std::cout << "[LINEARIZE] Error: " << error_total << std::endl;
+      double error_total =
+          rld_error + rel_pose_constraint_error  + marg_prior_error + rel_pose_pc_constraint_error;
 
       lopt.accum.setup_solver();
       Eigen::VectorXd Hdiag = lopt.accum.Hdiagonal();
 
       bool converged = false;
 
-      if (iter == max_iter) {
+      if (iter == max_iter)
+      {
         optim_H = lopt.accum.getH();
         optim_b = lopt.accum.getB();
-      } else if (iter == config.vio_take_keyframe_iteration) {
+      }
+      else if (iter == config.vio_take_keyframe_iteration)
+      {
         H_keyframe_decision = lopt.accum.getH();
         b_keyframe_decision = lopt.accum.getB();
-      } else {
-        if (config.vio_use_lm) {  // Use Levenberg–Marquardt
+      }
+      else
+      {
+        if (true)
+        {  // Use Levenberg–Marquardt
           bool step = false;
           int max_lm_iter = 10;
 
-          while (!step && max_lm_iter > 0 && !converged) {
+          while (!step && max_lm_iter > 0 && !converged)
+          {
             Eigen::VectorXd Hdiag_lambda = Hdiag * lambda;
             for (int i = 0; i < Hdiag_lambda.size(); i++)
+            {
               Hdiag_lambda[i] = std::max(Hdiag_lambda[i], min_lambda);
+            }
 
             const Eigen::VectorXd inc = lopt.accum.solve(&Hdiag_lambda);
 
@@ -1210,14 +1541,16 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             double after_error_total = -1.0;
             double f_diff = -1.0;
 
-            if (inc.allFinite()) {
+            if (inc.allFinite())
+            {
               max_inc = inc.array().abs().maxCoeff();
               if (max_inc < 1e-4) converged = true;
 
               backup();
 
               // apply increment to poses
-              for (auto& kv : frame_poses) {
+              for (auto& kv : frame_poses)
+              {
                 int idx = optim_order.abs_order_map.at(kv.first).first;
                 kv.second.applyInc(-inc.segment<se3_SIZE>(idx));
               }
@@ -1237,6 +1570,7 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
 
               double after_update_marg_prior_error = 0;
               double after_update_rel_pose_constraint_error = 0;
+              double after_update_rel_pc_pose_constraint_error = 0;
               double after_update_vision_error = 0;
 
               computeError(after_update_vision_error);
@@ -1246,31 +1580,38 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
                   config.vio_init_pose_weight, rel_translation_constraints,
                   frame_poses);
 
+/*              computeRelTranslationConstraintsError(
+                  optim_order, after_update_rel_pc_pose_constraint_error,
+                  config.vio_init_pose_weight, rel_translation_pose_constraints,
+                  frame_poses);*/
+
+/*              computeRelTranslationConstraintsErrorSE3(optim_order, after_update_rel_pc_pose_constraint_error,
+                                                       weight,
+                                                       rel_translation_pose_constraints,
+                                                       frame_poses);*/
+
               computeMargPriorError(marg_order, marg_H, marg_b,
                                     after_update_marg_prior_error);
 
+              after_update_marg_prior_error = 0;
+
               after_error_total = after_update_vision_error +
                                   after_update_rel_pose_constraint_error +
-                                  after_update_marg_prior_error;
+                                  after_update_marg_prior_error +
+                                  after_update_rel_pc_pose_constraint_error;
 
               f_diff = (error_total - after_error_total);
             }
 
-            if (f_diff < 0) {
-              if (config.vio_debug)
-                std::cout << "\t[REJECTED] lambda:" << lambda
-                          << " f_diff: " << f_diff << " max_inc: " << max_inc
-                          << " Error: " << after_error_total << std::endl;
+            if (f_diff < 0)
+            {
               lambda = std::min(max_lambda, lambda_vee * lambda);
               lambda_vee *= 2;
 
               restore();
-            } else {
-              if (config.vio_debug)
-                std::cout << "\t[ACCEPTED] lambda:" << lambda
-                          << " f_diff: " << f_diff << " max_inc: " << max_inc
-                          << " Error: " << after_error_total << std::endl;
-
+            }
+            else
+            {
               lambda = std::max(min_lambda, lambda / 3);
               lambda_vee = 2;
 
@@ -1278,18 +1619,19 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             }
             max_lm_iter--;
           }
-
-          if (config.vio_debug && converged) {
-            std::cout << "[CONVERGED]" << std::endl;
-          }
-        } else {  // Use Gauss-Newton
+        }
+        else
+        {  // Use Gauss-Newton
           Eigen::VectorXd Hdiag_lambda = Hdiag * min_lambda;
           for (int i = 0; i < Hdiag_lambda.size(); i++)
+          {
             Hdiag_lambda[i] = std::max(Hdiag_lambda[i], min_lambda);
+          }
 
           const Eigen::VectorXd inc = lopt.accum.solve(&Hdiag_lambda);
 
-          if (inc.allFinite()) {
+          if (inc.allFinite())
+          {
             double max_inc = inc.array().abs().maxCoeff();
             if (max_inc < 1e-4) converged = true;
 
@@ -1300,14 +1642,16 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             }
 
             // apply increment to states
-            for (auto& kv : frame_states) {
+            for (auto& kv : frame_states)
+            {
               int idx = optim_order.abs_order_map.at(kv.first).first;
               kv.second.applyInc(-inc.segment<se3_VEL_BIAS_SIZE>(idx));
             }
 
             // Update points
             tbb::blocked_range<size_t> keys_range(0, rld_vec.size());
-            auto update_points_func = [&](const tbb::blocked_range<size_t>& r) {
+            auto update_points_func = [&](const tbb::blocked_range<size_t>& r)
+            {
               for (size_t i = r.begin(); i != r.end(); ++i) {
                 const auto& rld = rld_vec[i];
                 updatePoints(optim_order, rld, inc);
@@ -1316,86 +1660,55 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             tbb::parallel_for(keys_range, update_points_func);
           }
         }
-
-        if (config.vio_debug) {
-          double after_update_marg_prior_error = 0;
-          double after_update_rel_pose_constraint_error = 0;
-          double after_update_vision_error = 0;
-
-          computeError(after_update_vision_error);
-
-          computeRelTranslationConstraintsError(
-              optim_order, after_update_rel_pose_constraint_error,
-              config.vio_init_pose_weight, rel_translation_constraints,
-              frame_poses);
-
-          computeMargPriorError(marg_order, marg_H, marg_b,
-                                after_update_marg_prior_error);
-
-          double after_error_total = after_update_vision_error +
-                                     after_update_rel_pose_constraint_error +
-                                     after_update_marg_prior_error;
-
-          double error_diff = error_total - after_error_total;
-
-          auto t2 = std::chrono::high_resolution_clock::now();
-
-          auto elapsed =
-              std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1);
-
-          std::cout << "iter " << iter
-                    << " before_update_error: vision: " << rld_error
-                    << " rel_translation_constraints: "
-                    << rel_pose_constraint_error
-                    << " marg_prior: " << marg_prior_error
-                    << " total: " << error_total << std::endl;
-
-          std::cout << "iter " << iter << "  after_update_error: vision: "
-                    << after_update_vision_error
-                    << " rel_translation_constraints: "
-                    << after_update_rel_pose_constraint_error
-                    << " marg_prior: " << after_update_marg_prior_error
-                    << " total: " << after_error_total << " error_diff "
-                    << error_diff << " time : " << elapsed.count()
-                    << "(us),  num_states " << frame_states.size()
-                    << " num_poses " << frame_poses.size() << std::endl;
-
-          if (after_error_total > error_total) {
-            std::cout << "increased error after update!!!" << std::endl;
-          }
-        }
       }
 
+
+      // rel_translation_pose_constraints.clear();
+
       if (converged && iter > config.vio_take_keyframe_iteration &&
-          iter > filter_iter) {
+          iter > filter_iter)
+      {
         iter = max_iter - 1;
-      } else if (iter == config.vio_take_keyframe_iteration) {
+      }
+      else if (iter == config.vio_take_keyframe_iteration)
+      {
         // calculate the negative entropy of the current frame as described in
         // "Redesigning SLAM for Arbitrary Multi-Camera Systems" Kuo et. al.
         // 2020 to decide if the previous frame should become a keyframe
         std::set<int> idx_old, idx_last;
-        for (const auto& kv : optim_order.abs_order_map) {
-          if (kv.second.second == se3_SIZE) {
+        for (const auto& kv : optim_order.abs_order_map)
+        {
+          if (kv.second.second == se3_SIZE)
+          {
             int start_idx = kv.second.first;
-            if (kv.first == this_state_t_ns) {
-              if (connected_finite > 5) {
+            if (kv.first == this_state_t_ns)
+            {
+              if (connected_finite > 5)
+              {
                 for (size_t i = 0; i < 3; i++) idx_last.emplace(start_idx + i);
-              } else {
+              }
+              else
+              {
                 // without triangulated points, translation is unconstrained
                 for (size_t i = 0; i < 3; i++) idx_old.emplace(start_idx + i);
               }
               for (size_t i = 3; i < se3_SIZE; i++)
                 idx_last.emplace(start_idx + i);
-            } else {
+            }
+            else
+            {
               for (size_t i = 0; i < se3_SIZE; i++)
                 idx_old.emplace(start_idx + i);
             }
-          } else {
+          }
+          else
+          {
             GRANITE_ASSERT(false);
           }
         }
 
-        if (!idx_old.empty() && !idx_last.empty()) {
+        if (!idx_old.empty() && !idx_last.empty())
+        {
           Eigen::MatrixXd H_last_state;
           Eigen::VectorXd b_last_state;
           // marginalizeHelper has side effects on H and b
@@ -1404,7 +1717,8 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
 
           const double det = H_last_state.determinant();
 
-          if (det > std::numeric_limits<double>::epsilon()) {
+          if (det > std::numeric_limits<double>::epsilon())
+          {
             negative_entropy_last_frame = std::log(det);
 
             increment_average_negative_entropy(negative_entropy_last_frame);
@@ -1420,26 +1734,34 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             if (negative_entropy_last_frame <=
                     config.vio_fraction_entropy_take_kf *
                         average_negative_entropy_last_frame ||
-                connected_finite + connected_infinite < 20) {
+                connected_finite + connected_infinite < 20)
+            {
               take_kf = true;
             }
-          } else {
+          } else
+          {
             take_kf = true;
           }
-        } else {
+        }
+        else
+        {
           take_kf = true;
         }
 
-        if (take_kf) {
+        if (take_kf)
+        {
           max_iter += 2;
           filter_iter += 2;
           create_keyframe(num_points_connected, connected_finite);
           converged = false;
 
           // rel_pose_initialization may have removed some kf
-          if (optim_order.items != frame_poses.size()) {
+          if (optim_order.items != frame_poses.size())
+          {
             optim_order.clear();
-            for (const auto& kv : frame_poses) {
+            for (const auto& kv : frame_poses)
+             {
+
               optim_order.abs_order_map[kv.first] =
                   std::make_pair(optim_order.total_size, se3_SIZE);
 
@@ -1453,18 +1775,12 @@ void KeypointVoEstimator::optimize(std::map<int64_t, int>& num_points_connected,
             }
           }
         }
-      } else if (filter && iter == filter_iter) {
+      }
+      else if (filter && iter == filter_iter)
+      {
         filterOutliers(config.vio_outlier_threshold, 3, &num_points_connected);
       }
-
-      // std::cerr << "LT\n" << LT << std::endl;I
-      // std::cerr << "z_p\n" << z_p.transpose() << std::endl;
-      // std::cerr << "inc\n" << inc.transpose() << std::endl;
     }
-  }
-
-  if (config.vio_debug) {
-    std::cout << "=================================" << std::endl;
   }
 }
 
@@ -1664,6 +1980,19 @@ std::optional<double> KeypointVoEstimator::monoScaleDriftVariance() const {
       ld.Hpp, ld.bp, translation_error, config.vio_init_pose_weight,
       rel_translation_constraints, frame_poses);
 
+
+/*  double translation_error2;
+  linearizeRelTranslationConstraintsRelSE3(
+      ld.Hpp, ld.bp, translation_error2, 1,
+      rel_translation_pose_constraints, frame_poses);*/
+
+/*  double rel_pose_pc_constraint_error;
+  linearizeRelTranslationConstraintsRelSE3(ld.Hpp, ld.bp,
+                                           rel_pose_pc_constraint_error,
+                                           100000000.0,
+                                           rel_translation_pose_constraints,
+                                           frame_poses);*/
+
   H = ld.Hpp;
   b = ld.bp;
 
@@ -1782,6 +2111,8 @@ void KeypointVoEstimator::computeProjections(
     std::vector<Eigen::aligned_vector<Eigen::Vector4d>>& data) const {
   for (const auto& kv : lmdb.getObservations()) {
     const TimeCamId& tcid_h = kv.first;
+
+    // std::cout << " --------------------- KeypointVoEstimator::computeProjections" << std::endl;
 
     for (const auto& obs_kv : kv.second) {
       const TimeCamId& tcid_t = obs_kv.first;

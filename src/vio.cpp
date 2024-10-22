@@ -59,6 +59,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <pangolin/gl/gldraw.h>
 #include <pangolin/pangolin.h>
 
+#include <inttypes.h>
+
 #include <CLI/CLI.hpp>
 
 #include <granite/io/dataset_io.h>
@@ -72,6 +74,11 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <granite/serialization/headers_serialization.h>
 
 #include <granite/utils/vis_utils.h>
+
+#include <fstream>
+#include <string>
+#include <vector>
+#include <sstream>
 
 #include <algorithm>
 #include <atomic>
@@ -89,16 +96,17 @@ class VioDataset {
              const bool show_gui, const bool use_imu, const bool step_by_step,
              const bool print_queue)
       : show_gui(show_gui),
-        step_by_step(step_by_step),
+        step_by_step(true),
         show_frame("ui.show_frame", 0, 0, 1500),
 
         show_flow("ui.show_flow", false, false, true),
-        show_obs("ui.show_obs", true, false, true),
+        show_obs("ui.show_obs", false, false, true),
         show_ids("ui.show_ids", false, false, true),
         show_epipolar("ui.show_epipolar", false, false, true),
 
-        show_kf("plot_panel.show_kf", true, false, true),
-        show_est_pos("plot_panel.show_est_pos", true, false, true),
+
+        show_kf("plot_panel.show_kf", false, false, false), //
+        show_est_pos("plot_panel.show_est_pos", false, false, false), //
         show_est_vel("plot_panel.show_est_vel", false, false, true),
         show_est_bg("plot_panel.show_est_bg", false, false, true),
         show_est_ba("plot_panel.show_est_ba", false, false, true),
@@ -126,10 +134,12 @@ class VioDataset {
     imu_data_queue.set_capacity(300);
 
     // load configuration
-    if (!config_path.empty()) {
+    if (!config_path.empty())
+    {
       vio_config.load(config_path);
 
-      if (vio_config.vio_enforce_realtime) {
+      if (vio_config.vio_enforce_realtime)
+      {
         vio_config.vio_enforce_realtime = false;
         std::cout
             << "The option vio_config.vio_enforce_realtime was enabled, "
@@ -145,6 +155,8 @@ class VioDataset {
 
     // load dataset
     {
+      std::cout << "vv: " << dataset_type << std::endl;
+      std::cout << "vv dataset_path: " << dataset_path << std::endl;
       granite::DatasetIoInterfacePtr dataset_io =
           granite::DatasetIoFactory::getDatasetIo(dataset_type);
 
@@ -209,6 +221,93 @@ class VioDataset {
     vio->out_state_queue = &out_state_queue;
   }
 
+  /**
+   * This function reads the .csv file with GPS data and returns
+   * vector of poses.
+   * @return The vector of GPS poses.
+   */
+  std::vector<granite::GPSconstraint> readConstraints()
+  {
+    /// Timestamps of images and GPS frames is sligtly different, so we need to
+    /// scale (gps or images) by difference un timestamps.
+    int64_t firstFrame = 1683701468001151088;
+
+    std::string path = gps_path;
+    std::vector<granite::GPSconstraint> constraints;
+
+    std::vector<std::vector<std::string>> content;
+    std::vector<std::string> row;
+    std::string line, word;
+    std::fstream file (path, std::ios::in);
+    if(file.is_open())
+    {
+      while(getline(file, line))
+      {
+        row.clear();
+
+        std::stringstream str(line);
+
+        while(getline(str, word, ','))
+          row.push_back(word);
+        content.push_back(row);
+      }
+    }
+
+    file.close();
+
+    /*
+     * ['Time',   ---- 0
+     * 'header.seq',  ---- 1
+     * 'header.stamp.secs',  ---- 2 ===
+     * 'header.stamp.nsecs',  --- 3 ===
+     * 'header.frame_id',  ---- 4
+     * 'pose.position.x',  ---- 5
+     * 'pose.position.y',  ---- 6
+     * 'pose.position.z',  ---- 7
+     * 'pose.orientation.x',  --- 8
+     * 'pose.orientation.y',  --- 9
+     * 'pose.orientation.z',  --- 10
+     * 'pose.orientation.w'] ---- 11
+     */
+    for (size_t i = 1; i < content.size(); ++i)
+    {
+      auto rrow = content[i];
+      std::string timestamp_sec = rrow[2];
+      std::string timestamp_nsec = rrow[3];
+      auto result_sec = std::stod(timestamp_sec);
+      auto result_nsec = std::stod(timestamp_nsec);
+
+      auto timestamp = (int64_t)(result_sec * 1e9 + result_nsec);
+
+      auto result_x = std::stod(rrow[5]);
+      auto result_y = std::stod(rrow[6]);
+      auto result_z = std::stod(rrow[7]);
+
+      auto result_q_x = std::stod(rrow[8]);
+      auto result_q_y = std::stod(rrow[9]);
+      auto result_q_z = std::stod(rrow[10]);
+      auto result_q_w = std::stod(rrow[11]);
+
+      granite::GPSconstraint poseConstraint;
+      poseConstraint.timestamp = timestamp;
+      poseConstraint.q = Eigen::Quaterniond(result_q_w, result_q_x, result_q_y, result_q_z);
+      poseConstraint.p = Eigen::Vector3d(result_x, result_y, result_z);
+
+      constraints.push_back(poseConstraint);
+    }
+
+    int64_t diff = std::abs(firstFrame - constraints[0].timestamp);
+
+    for (auto& pc : constraints)
+    {
+      pc.timestamp += diff;
+    }
+
+    return constraints;
+  }
+
+
+
   void run() {
     auto time_start = std::chrono::high_resolution_clock::now();
 
@@ -230,6 +329,8 @@ class VioDataset {
       }
     }
 
+    auto constraints = readConstraints();
+    vio->pushPoseConstraints(constraints);
     vio->initialize(Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     feedImagesLoop();
@@ -678,10 +779,13 @@ class VioDataset {
 
       granite::VioVisualizationData::Ptr data;
 
-      while (!terminate) {
-        try {
+      while (!terminate)
+      {
+        try
+        {
           out_vis_queue.pop(data);
-        } catch (const tbb::user_abort&) {
+        } catch (const tbb::user_abort&)
+        {
           break;
         };
 
@@ -767,7 +871,8 @@ class VioDataset {
 
   /// @brief Starts thread that listens to out_state_queue and populates some
   /// data structures for evaluation
-  void stateLoop() {
+  void stateLoop()
+  {
     state_receiver.reset(new std::thread([&]() {
       std::cout << "Started state receiver thread" << std::endl;
 
@@ -870,13 +975,9 @@ class VioDataset {
   /// @brief Updates image display to currently `show_frame`. Draws overlays for
   /// optical flow, landmark reprojection, epipolar curves, ... . Gets data from
   /// vis_map.
-  void draw_image_overlay(pangolin::View& v, granite::CamId cam_id) {
+  void draw_image_overlay(pangolin::View& v, granite::CamId cam_id)
+  {
     UNUSED(v);
-
-    //  size_t frame_id = show_frame;
-    //  granite::TimeCamId tcid =
-    //      std::make_pair(vio_dataset->get_image_timestamps()[frame_id],
-    //      cam_id);
 
     glColor3f(1.0, 0.0, 0.0);
     pangolin::GlFont::I()
@@ -1254,9 +1355,12 @@ class VioDataset {
                          "n avg entropy last frame", &vis_data_log);
     }
 
-    if (show_kf) {
-      for (size_t idx = 0; idx < vio_kf.size(); idx++) {
-        if (vio_kf.at(idx)) {
+    if (show_kf)
+    {
+      for (size_t idx = 0; idx < vio_kf.size(); idx++)
+      {
+        if (vio_kf.at(idx))
+        {
           double t =
               (vio_dataset->get_image_timestamps()[idx] - start_t_ns) * 1e-9;
           plotter->AddMarker(pangolin::Marker::Vertical, t,
@@ -1340,16 +1444,20 @@ class VioDataset {
   /// thread.
   ///
   /// @returns true if increment was possible otherwise false
-  bool next_step() {
-    if (show_frame < int(vio_dataset->get_image_timestamps().size()) - 1) {
+  bool next_step()
+  {
+    if (show_frame < int(vio_dataset->get_image_timestamps().size()) - 1)
+    {
       if (last_pushed_t_ns >=
-          vio_dataset->get_image_timestamps().at(show_frame)) {
+          vio_dataset->get_image_timestamps().at(show_frame))
+      {
         show_frame = show_frame + 1;
         show_frame.Meta().gui_changed = true;
       }
       if (vio_t_ns.empty() ||
           vio_t_ns.back().back() <
-              vio_dataset->get_image_timestamps().at(show_frame)) {
+              vio_dataset->get_image_timestamps().at(show_frame))
+      {
         cv.notify_one();
       }
       return true;
@@ -1418,7 +1526,8 @@ class VioDataset {
       vio_T = vio_T_w_c0;
     }
 
-    if (tum_rgbd_fmt) {
+    if (true)
+    {
       std::ofstream os("trajectory.txt");
 
       if (calib.T_i_c.size() < 2 && !use_imu) {
@@ -1431,7 +1540,7 @@ class VioDataset {
       for (size_t i = 0; i < vio_t_ns.at(best_idx).size(); i++) {
         const Sophus::SE3d& pose = vio_T.at(best_idx)[i];
         os << std::scientific << std::setprecision(18)
-           << vio_t_ns.at(best_idx)[i] * 1e-9 << " " << pose.translation().x()
+           << vio_t_ns.at(best_idx)[i] << " " << pose.translation().x()
            << " " << pose.translation().y() << " " << pose.translation().z()
            << " " << pose.unit_quaternion().x() << " "
            << pose.unit_quaternion().y() << " " << pose.unit_quaternion().z()
@@ -1443,7 +1552,7 @@ class VioDataset {
       std::cout
           << "Saved trajectory in TUM RGB-D Dataset format in trajectory.txt"
           << std::endl;
-    } else if (euroc_fmt) {
+    } else if (false) {
       std::ofstream os("trajectory.csv");
 
       if (calib.T_i_c.size() < 2 && !use_imu) {
@@ -1671,8 +1780,15 @@ class VioDataset {
     os.close();
   }
 
+  void set_gps_path(const std::string& p)
+  {
+    gps_path = p;
+  }
+
   // GUI constants
   static constexpr int PANEL_WIDTH = 200;
+
+  std::string gps_path = "";
 
   // GUI variables
   bool show_gui = true;
@@ -1680,7 +1796,7 @@ class VioDataset {
   size_t last_frame_processed = 0;
   std::mutex m;
   std::condition_variable cv;
-  bool step_by_step = false;
+  bool step_by_step = true;
   std::atomic<granite::FrameId> last_pushed_t_ns = -1;
 
   // GUI settings
@@ -1795,6 +1911,7 @@ int main(int argc, char** argv) {
   std::string trajectory_fmt;
   std::string marg_data_path;
   int num_threads = 0;
+  std::string gps_data_path;
 
   CLI::App app{"App description"};
 
@@ -1823,9 +1940,14 @@ int main(int argc, char** argv) {
   app.add_option("--save-trajectory", trajectory_fmt,
                  "Save trajectory. Supported formats <tum, euroc, kitti>");
   app.add_option("--use-imu", use_imu, "Use IMU.");
+  app.add_option("--gps_data", gps_data_path, "GPS data, ASSIGNMENT")->required();
+
+
+  std::cout << "dataset_path: " << dataset_path << std::endl;
 
   // global thread limit is in effect until global_control object is destroyed
   std::unique_ptr<tbb::global_control> tbb_global_control;
+  num_threads = 0;
   if (num_threads > 0) {
     tbb_global_control = std::make_unique<tbb::global_control>(
         tbb::global_control::max_allowed_parallelism, num_threads);
@@ -1837,6 +1959,8 @@ int main(int argc, char** argv) {
     return app.exit(e);
   }
 
+  std::cout << "gps_data_path: " << gps_data_path << std::endl;
+
   if (!show_gui) {
     std::cout
         << "You tried to start the system without GUI but without autostart."
@@ -1847,6 +1971,8 @@ int main(int argc, char** argv) {
   VioDataset vd(cam_calib_path, config_path, dataset_type, dataset_path,
                 marg_data_path, result_path, stats_path, trajectory_fmt,
                 show_gui, use_imu, step_by_step, print_queue);
+
+  vd.set_gps_path(gps_data_path);
 
   vd.run();
 

@@ -557,7 +557,8 @@ InitializationResult evaluate_initialization_candidate(
     const OpticalFlowResult::Ptr& opt_flow_a,
     const OpticalFlowResult::Ptr& opt_flow_b, const Sophus::SE3d& current_T_a_b,
     const GenericCamera<double>& cam_a, const GenericCamera<double>& cam_b,
-    double min_parallax_deg = 5.0, unsigned int max_ransac_iter = 20) {
+    double min_parallax_deg = 5.0, unsigned int max_ransac_iter = 20)
+{
   // look for correspondences in both optical flow results
   // store the bearing vectors for relative pose estimation
   std::vector<KeypointId> obs_idxs;
@@ -700,13 +701,16 @@ class ParallelInitializationCandidateEvaluation {
  public:
   InitializationResult best_init_res;
 
-  void operator()(const tbb::blocked_range<size_t>& r) {
+  void operator()(const tbb::blocked_range<size_t>& r)
+  {
     InitializationResult tmp_best_init_res = best_init_res;
     const TimeCamId tcid_a(opt_flow_a->t_ns, 0);
-    for (size_t i = r.begin(); i != r.end(); ++i) {
+    for (size_t i = r.begin(); i != r.end(); ++i)
+    {
       auto opt_flow_iter = std::next(opt_flow_bs.begin(), i);
       // TODO make cam_id parameter
-      if (opt_flow_iter->first != opt_flow_a->t_ns) {
+      if (opt_flow_iter->first != opt_flow_a->t_ns)
+      {
         const TimeCamId tcid_b(opt_flow_iter->first, 0);
         InitializationResult init_res = evaluate_initialization_candidate(
             tcid_a, tcid_b, opt_flow_a, opt_flow_iter->second,

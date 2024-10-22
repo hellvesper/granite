@@ -60,16 +60,20 @@ namespace granite {
 
 /// @brief relative translation error for SE3 absolute parametrization
 inline double relTranslationError(
-    const double norm_should, const Sophus::SE3d& T_w_i,
+    const double norm_should,
+    const Sophus::SE3d& T_w_i,
     const Sophus::SE3d& T_w_j,
     Eigen::Matrix<double, 1, 3>* d_res_d_T_w_i = nullptr,
-    Eigen::Matrix<double, 1, 3>* d_res_d_T_w_j = nullptr) {
+    Eigen::Matrix<double, 1, 3>* d_res_d_T_w_j = nullptr)
+{
   const Sophus::SE3d T_j_w = T_w_j.inverse();
   const Sophus::SE3d T_j_i = T_j_w * T_w_i;
+
   const double norm_is = T_j_i.translation().norm();
   double res = norm_is - norm_should;
 
-  if (d_res_d_T_w_i || d_res_d_T_w_j) {
+  if (d_res_d_T_w_i || d_res_d_T_w_j)
+  {
     const Eigen::Matrix<double, 1, 3> der = 1.0 / norm_is *
                                             T_j_i.translation().transpose() *
                                             T_j_w.rotationMatrix();
@@ -86,13 +90,68 @@ inline double relTranslationError(
   return res;
 }
 
+inline double relTranslationErrorSE3_2(
+    const double norm_should,
+    const Sophus::SE3d& T_w_i,
+    const Sophus::SE3d& T_w_j,
+    Eigen::Matrix<double, 1, se3_SIZE>* a1 =
+                                   nullptr,
+    Eigen::Matrix<double, 1, se3_SIZE>* a2 =
+        nullptr)
+{
+  const Sophus::SE3d T_j_w = T_w_j.inverse();
+  const Sophus::SE3d T_j_i = T_j_w * T_w_i;
+
+  const double norm_is = T_j_i.translation().norm();
+  double res = norm_is - norm_should;
+
+  if (a1)
+  {
+    Eigen::Matrix<double, 1, se3_SIZE> d_diff_d_trans;
+    d_diff_d_trans.setZero();
+    d_diff_d_trans.topLeftCorner<1, 3>() =
+        1.0 / norm_is * T_j_i.translation().transpose();
+
+    Sophus::SE3d T_i_j_iter;
+    Sophus::Matrix6d d_inc_d_xi;
+    d_inc_d_xi.setIdentity();
+    d_inc_d_xi.topLeftCorner<3, 3>() =
+        -T_j_i.rotationMatrix().transpose();
+    d_inc_d_xi.block<3, 3>(3, 3) = -T_j_i.rotationMatrix().transpose();
+
+    (*a1) = d_diff_d_trans * T_i_j_iter.Adj() * d_inc_d_xi;
+  }
+  if (a2)
+  {
+    Eigen::Matrix<double, 1, se3_SIZE> d_diff_d_trans;
+    d_diff_d_trans.setZero();
+    d_diff_d_trans.topLeftCorner<1, 3>() =
+        1.0 / norm_is * T_j_i.translation().transpose();
+
+    Sophus::SE3d T_i_j_iter;
+    Sophus::Matrix6d d_inc_d_xi;
+    d_inc_d_xi.setIdentity();
+    d_inc_d_xi.topLeftCorner<3, 3>() =
+        -T_j_i.rotationMatrix().transpose();
+    d_inc_d_xi.block<3, 3>(3, 3) = -T_j_i.rotationMatrix().transpose();
+
+    (*a2) = (d_diff_d_trans * T_i_j_iter.Adj() * d_inc_d_xi).transpose();
+  }
+
+  return res;
+}
+
 /// @brief relative translation error for SE3 relative parametrization
+///
 inline double relTranslationErrorSE3(
-    const double norm_should, const Eigen::aligned_vector<Sophus::SE3d>& T_i_js,
+    const double norm_should,
+    const Eigen::aligned_vector<Sophus::SE3d>& T_i_js,
     Eigen::aligned_vector<Eigen::Matrix<double, 1, se3_SIZE>>* d_res_d_xis =
-        nullptr) {
+        nullptr)
+{
   Sophus::SE3d T_i_j;
-  for (const auto& T : T_i_js) {
+  for (const auto& T : T_i_js)
+  {
     T_i_j *= T;
   }
   Sophus::SE3d T_j_i = T_i_j.inverse();
@@ -100,7 +159,8 @@ inline double relTranslationErrorSE3(
   const double norm_is = T_j_i.translation().norm();
   double res = norm_is - norm_should;
 
-  if (d_res_d_xis) {
+  if (d_res_d_xis)
+  {
     Eigen::Matrix<double, 1, se3_SIZE> d_diff_d_trans;
     d_diff_d_trans.setZero();
     d_diff_d_trans.topLeftCorner<1, 3>() =
